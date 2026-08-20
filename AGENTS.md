@@ -2,39 +2,55 @@
 
 ## Project Structure & Module Organization
 
-This repository is a design starter pack for **LLM Knowledge Lab**, a local knowledge compiler. Read the numbered documents in order:
+Memorex is a Python 3.13 CLI and local knowledge compiler. Application code lives in
+`src/memorex/`; keep CLI wiring, deterministic ingest, LLM adapters, query logic, and
+SQLite persistence in separate modules. Numbered SQL migrations live under
+`src/memorex/migrations/`. Tests are in `tests/`, CI is in `.github/workflows/`, and
+the numbered Markdown files document product intent and implementation status.
 
-- `00_PROJECT_CONTEXT.md`: product goals and core invariants.
-- `01_ARCHITECTURE_IDEAS.md`: candidate architecture and retrieval approaches.
-- `02_MVP_AND_EVOLUTION.md`: staged MVP and acceptance scenarios.
-- `03_CODEX_STARTER_BRIEF.md`: implementation priorities and engineering constraints.
-- `04_OPEN_QUESTIONS.md`: decisions that must remain open until discussed.
-
-`README.md` is the entry point. There is no source, test, or asset directory yet. When implementation begins, keep code, tests, migrations, fixtures, and generated Wiki output separate; generated views must never become source evidence.
+Runtime data belongs in `.memorex/` and must not be committed. Generated knowledge
+and answers are derived views, never source evidence.
 
 ## Build, Test, and Development Commands
 
-No build system, dependency manifest, or executable code is committed yet. For documentation work, useful checks are:
-
 ```bash
-rg '^#' *.md        # inspect heading structure
-git diff --check    # catch whitespace errors in a Git checkout
+uv sync --locked --all-groups  # install exact runtime and dev dependencies
+uv run memorex --help          # inspect the CLI
+uv run ruff check .            # lint Python
+uv run ruff format --check .   # verify formatting
+uv run pytest                  # run offline tests
 ```
 
-Document new bootstrap, run, lint, migration, and test commands in `README.md` when introducing them. Prefer a CLI-first workflow and SQLite with FTS5 initially.
+Use `uv run memorex init` before local CLI experiments. Document new commands in
+`README.md` when introducing them.
 
 ## Coding Style & Naming Conventions
 
-Write Markdown with concise headings, short paragraphs, fenced code blocks, and backticks around paths, commands, and schema fields. Preserve the numeric prefix convention for ordered design documents. For future code, use small modules, explicit data structures, deterministic pipeline stages, schema migrations, and the language's standard formatter. Avoid hidden state, provider-specific LLM coupling, and unvalidated structured model output.
+Use four-space indentation, Python type annotations, small single-purpose modules,
+and explicit SQL behind the `Storage` boundary. Ruff is the formatter and linter.
+Name functions and modules with `snake_case`, classes with `PascalCase`, constants
+with `UPPER_SNAKE_CASE`, and tests by observable behavior, for example
+`test_reingest_is_idempotent`. Validate every structured model response with
+Pydantic; never add an unvalidated JSON fallback.
 
 ## Testing Guidelines
 
-No test framework or coverage threshold is configured. New code should introduce automated tests and fixtures alongside the feature. At minimum, cover idempotent re-ingest, changed-source revisions, exact evidence provenance, superseded claims, and the rule that synthesis is not evidence. Name tests by observable behavior, for example `test_reingest_does_not_duplicate_claims`.
+Pytest is required for every behavioral change. Use temporary workspaces and fake
+LLM providers so CI never needs network access or credentials. Cover unchanged
+re-ingest, changed-source revisions, object deduplication, exact provenance offsets,
+failed validation, active-job selection, claims-first retrieval, and citation
+validation. A real endpoint smoke test is manual and must use non-sensitive data.
 
 ## Commit & Pull Request Guidelines
 
-The repository is initialized but has no commits yet, so no commit convention has been established. Use short, imperative subjects such as `Add source checksum registry`, and keep unrelated changes separate. Pull requests should explain the problem, approach and trade-offs, affected pipeline stages or schema, validation performed, and any open question resolved. Link issues; include CLI output or screenshots when behavior or generated views change.
+Use short imperative subjects such as `Add versioned source ingest`. Keep commits
+cohesive and run all three checks above before pushing. Pull requests should explain
+the problem, chosen trade-offs, schema or pipeline impact, validation performed, and
+any decision taken from `04_OPEN_QUESTIONS.md`. Link issues and include CLI output
+when behavior changes.
 
-## Data Integrity & Architecture
+## Data Integrity & Configuration
 
-Treat raw sources as immutable. Make ingest idempotent, attach every claim to precise evidence, validate all LLM structured output, log model and prompt versions, and keep every derived representation rebuildable. Propose options before encoding unresolved choices from `04_OPEN_QUESTIONS.md`.
+Treat source objects as immutable, ingest as idempotent, synthesis as non-evidence,
+and derived records as rebuildable. Never commit `.env`, API keys, `.memorex/`, or
+private corpus data. Log model and prompt versions, but never secrets.
