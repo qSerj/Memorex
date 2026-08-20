@@ -103,6 +103,36 @@ def test_invalid_evidence_fails_job_without_active_claims(tmp_path: Path) -> Non
     assert len(provider.calls) == 3
 
 
+def test_extraction_anchors_model_collapsed_line_break_to_exact_source_span(tmp_path: Path) -> None:
+    storage = Storage(WorkspaceConfig(tmp_path / ".memorex"))
+    storage.initialize()
+    source = tmp_path / "source.md"
+    source.write_text("Memorex stores immutable\nsource copies.", encoding="utf-8")
+    source_id = storage.ingest_source(parse_source(source))["source_id"]
+    provider = FakeProvider(
+        [
+            json.dumps(
+                {
+                    "claims": [
+                        {
+                            "statement": "Memorex stores immutable source copies.",
+                            "confidence": 0.98,
+                            "evidence_quote": "Memorex stores immutable source copies.",
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+
+    extract_source(storage, source_id, provider, llm_config())
+
+    claim = storage.get_claim(storage.list_claims(source_id)[0]["id"])
+    assert claim["quote"] == "Memorex stores immutable\nsource copies."
+    version = storage.get_current_version(source_id)
+    assert version["normalized_text"][claim["char_start"] : claim["char_end"]] == claim["quote"]
+
+
 def test_force_extraction_replaces_active_claim_set(tmp_path: Path) -> None:
     storage, source_id = prepared_source(tmp_path)
     first_provider = FakeProvider([claim_output()])
@@ -135,6 +165,19 @@ def test_claims_first_answer_validates_and_returns_evidence(tmp_path: Path) -> N
     assert result["status"] == "answered"
     assert result["citations"][0]["id"] == claim_id
     assert result["citations"][0]["quote"] == "Memorex uses SQLite for local storage."
+
+
+def test_answer_adds_validated_marker_when_model_omits_it(tmp_path: Path) -> None:
+    storage, source_id = prepared_source(tmp_path)
+    extract_source(storage, source_id, FakeProvider([claim_output()]), llm_config())
+    claim_id = storage.list_claims(source_id)[0]["id"]
+    provider = FakeProvider(
+        [json.dumps({"answer": "Memorex uses SQLite for local storage.", "citations": [claim_id]})]
+    )
+
+    result = answer_question(storage, "What uses SQLite?", provider, llm_config())
+
+    assert result["answer"] == f"Memorex uses SQLite for local storage. [C{claim_id}]"
 
 
 def test_answer_rejects_unknown_citations_after_retries(tmp_path: Path) -> None:

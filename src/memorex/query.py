@@ -11,13 +11,14 @@ from memorex.domain import AnswerResult
 from memorex.llm import LLMProvider
 from memorex.storage import Storage, utc_now
 
-ANSWER_PROMPT_VERSION = "answer-v1"
+ANSWER_PROMPT_VERSION = "answer-v2"
 MAX_ATTEMPTS = 3
 
 ANSWER_SYSTEM_PROMPT = """Answer only from the supplied claims and evidence.
 Every factual statement must cite one or more candidate labels such as [C12].
 Return the database claim IDs you cited. If the evidence is insufficient, say so.
-Never cite an ID that is not present in the supplied context."""
+Never cite an ID that is not present in the supplied context. Your answer must literally
+include every cited label in the form [C12]."""
 
 
 class QueryError(RuntimeError):
@@ -83,7 +84,7 @@ def answer_question(
             input_tokens = result.input_tokens
             output_tokens = result.output_tokens
             answer = AnswerResult.model_validate_json(raw_output)
-            _validate_citations(answer, allowed_ids)
+            rendered_answer = _render_cited_answer(answer, allowed_ids)
         except Exception as exc:
             last_error = _friendly_validation_error(exc)
             storage.record_llm_call(
@@ -125,21 +126,25 @@ def answer_question(
         return {
             "status": "answered",
             "question": question,
-            "answer": answer.answer,
+            "answer": rendered_answer,
             "citations": cited,
         }
     raise QueryError(f"Answer failed after {MAX_ATTEMPTS} attempts: {last_error}")
 
 
-def _validate_citations(answer: AnswerResult, allowed_ids: set[int]) -> None:
+def _render_cited_answer(answer: AnswerResult, allowed_ids: set[int]) -> str:
     listed = set(answer.citations)
     markers = {int(value) for value in re.findall(r"\[C(\d+)]", answer.answer)}
     if not listed:
         raise ValueError("answer must cite at least one retrieved claim")
     if not listed <= allowed_ids:
         raise ValueError("answer cites a claim outside the retrieved context")
-    if markers != listed:
+    if markers and markers != listed:
         raise ValueError("citation markers in answer must exactly match citations")
+    if markers:
+        return answer.answer
+    labels = " ".join(f"[C{claim_id}]" for claim_id in answer.citations)
+    return f"{answer.answer} {labels}"
 
 
 def _friendly_validation_error(exc: Exception) -> str:

@@ -11,14 +11,15 @@ from memorex.domain import ClaimBatch
 from memorex.llm import LLMProvider
 from memorex.storage import Storage, utc_now
 
-EXTRACTION_PROMPT_VERSION = "extract-v1"
+EXTRACTION_PROMPT_VERSION = "extract-v2"
 MAX_ATTEMPTS = 3
 
 EXTRACTION_SYSTEM_PROMPT = """You extract atomic claims from one source segment.
 Return only claims explicitly supported by the segment. Do not infer missing facts.
 Preserve the source language. Each evidence_quote must be a verbatim, minimal substring
-of the segment that uniquely supports the statement. Return an empty list when there
-are no factual claims."""
+of the segment that uniquely supports the statement. Preserve all punctuation, Markdown
+characters, spaces, and line breaks in evidence_quote exactly as they appear in the
+segment. Return an empty list when there are no factual claims."""
 
 
 class ExtractionError(RuntimeError):
@@ -147,7 +148,7 @@ def _extract_segment(
 def _anchor_claims(batch: ClaimBatch, segment: dict[str, Any]) -> list[dict[str, Any]]:
     anchored: list[dict[str, Any]] = []
     for claim in batch.claims:
-        matches = list(re.finditer(re.escape(claim.evidence_quote), segment["text"]))
+        matches = _find_quote_matches(claim.evidence_quote, segment["text"])
         if len(matches) != 1:
             raise ValueError(
                 "evidence_quote must occur exactly once in its segment; "
@@ -160,12 +161,24 @@ def _anchor_claims(batch: ClaimBatch, segment: dict[str, Any]) -> list[dict[str,
                 "statement": claim.statement,
                 "normalized_statement": " ".join(claim.statement.casefold().split()),
                 "confidence": claim.confidence,
-                "quote": claim.evidence_quote,
+                "quote": segment["text"][local_start:local_end],
                 "char_start": segment["char_start"] + local_start,
                 "char_end": segment["char_start"] + local_end,
             }
         )
     return anchored
+
+
+def _find_quote_matches(quote: str, segment_text: str) -> list[re.Match[str]]:
+    """Find an exact quote, tolerating only model-collapsed whitespace as a fallback."""
+    exact_matches = list(re.finditer(re.escape(quote), segment_text))
+    if exact_matches:
+        return exact_matches
+
+    whitespace_tolerant_pattern = r"\s+".join(
+        re.escape(part) for part in re.split(r"\s+", quote) if part
+    )
+    return list(re.finditer(whitespace_tolerant_pattern, segment_text))
 
 
 def _friendly_validation_error(exc: Exception) -> str:
