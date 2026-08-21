@@ -122,7 +122,20 @@ def _wiki_service(ctx: typer.Context) -> WikiFirstService:
     state = _state(ctx)
     if state.settings is None:
         raise ConfigurationError("Wiki-first commands require --workspace PATH")
-    return WikiFirstService(state.settings)
+
+    def progress(event: dict[str, object]) -> None:
+        phase = str(event.get("phase", "working"))
+        details = " ".join(
+            str(event[key]) for key in ("runner", "model", "fallback") if event.get(key) is not None
+        )
+        if phase == "retrieval":
+            details = (
+                f"sources={event.get('sources', 0)} "
+                f"wiki={event.get('selected_count', 0)}/{event.get('total_pages', 0)}"
+            )
+        typer.echo(f"[{phase}] {details}".rstrip(), err=True)
+
+    return WikiFirstService(state.settings, progress=progress)
 
 
 @wiki_app.command("status")
@@ -525,6 +538,21 @@ def serve(
     from memorex.web import run_server
 
     run_server(path, host=host, port=port)
+
+
+@app.command("app")
+def wiki_web_app(
+    path: Annotated[
+        Path | None,
+        typer.Argument(help="Wiki-first workspace; defaults to the last workspace."),
+    ] = None,
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8766,
+    no_browser: Annotated[bool, typer.Option("--no-browser")] = False,
+) -> None:
+    """Run the local Wiki-first app and open it in a browser."""
+    from memorex.wiki_app import run_server
+
+    run_server(path, host="127.0.0.1", port=port, open_browser=not no_browser)
 
 
 @claim_app.command("list")

@@ -40,6 +40,18 @@ uv run memorex --workspace ./my-knowledge wiki ask \
   "Почему мы изменили подход к лаборатории моделей?"
 ```
 
+Для обычной локальной работы предварительный `workspace init` не нужен: Web-приложение само
+предложит создать или выбрать workspace и запомнит последний выбранный путь.
+
+```bash
+uv run memorex app ./my-knowledge
+# следующие запуски могут быть просто: uv run memorex app
+```
+
+Приложение доступно только на `127.0.0.1`, использует локальные Jinja/CSS/JS и содержит Wiki,
+Inbox, обязательный Review, сохраняемый Chat и History. После Apply/Rollback оно атомарно обновляет
+read-only Obsidian vault в `WORKSPACE/vault/`; любые ручные правки vault заменяются при Refresh.
+
 Перед ingest не нужно заполнять title, author, date, type или authority. В первой версии принимаются
 UTF-8 `.txt` и `.md`; модель читает каждый файл целиком и сама извлекает полезный контекст. Команда
 `wiki tell` тем же reviewable путём передаёт Wiki произвольную мысль, поправку или предпочтение:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -15,6 +18,10 @@ class RunnerError(RuntimeError):
     def __init__(self, message: str, *, result: RunnerResult | None = None):
         super().__init__(message)
         self.result = result
+
+
+class RunnerCancelled(RunnerError):
+    """Raised after a requested, graceful runner termination."""
 
 
 class TokenUsage(BaseModel):
@@ -42,47 +49,95 @@ class CLIAgentRunner(AgentRunner):
         self.timeout = timeout
 
     def run(self, workdir: Path, prompt: str, *, writable: bool) -> RunnerResult:
+        return self.run_with_progress(workdir, prompt, writable=writable)
+
+    def run_with_progress(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        writable: bool,
+        progress: Callable[[dict[str, object]], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> RunnerResult:
         executable = shutil.which(self.name)
         if executable is None:
             raise RunnerError(f"Runner executable is not installed: {self.name}")
         command = self._command(executable, prompt, writable=writable)
         version = self._version(executable)
         started = time.monotonic()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=workdir,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            duration = int((time.monotonic() - started) * 1000)
-            result = RunnerResult(
-                runner=self.name,
-                model=self.model,
-                command_version=version,
-                duration_ms=duration,
-                stdout=str(exc.stdout or ""),
-                stderr=str(exc.stderr or ""),
-            )
-            raise RunnerError(
-                f"{self.name} timed out after {self.timeout} seconds", result=result
-            ) from exc
+        if progress:
+            progress({"phase": "runner", "runner": self.name, "model": self.model})
+        process = subprocess.Popen(
+            command,
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        def drain(stream: object, target: list[str], *, events: bool) -> None:
+            if stream is None:
+                return
+            for line in stream:
+                target.append(line)
+                if events and progress and (event := _safe_progress_event(line)):
+                    progress(event)
+
+        readers = [
+            threading.Thread(
+                target=drain, args=(process.stdout, stdout_lines), kwargs={"events": True}
+            ),
+            threading.Thread(
+                target=drain, args=(process.stderr, stderr_lines), kwargs={"events": False}
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        cancelled = False
+        timed_out = False
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
+            if time.monotonic() - started > self.timeout:
+                timed_out = True
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
+            time.sleep(0.05)
+        for reader in readers:
+            reader.join(timeout=5)
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
         duration = int((time.monotonic() - started) * 1000)
         result = RunnerResult(
             runner=self.name,
             model=self.model,
             command_version=version,
             duration_ms=duration,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            **_parse_usage(self.name, completed.stdout),
+            stdout=stdout,
+            stderr=stderr,
+            **_parse_usage(self.name, stdout),
         )
-        if completed.returncode != 0:
+        if cancelled:
+            raise RunnerCancelled(f"{self.name} was stopped", result=result)
+        if timed_out:
+            raise RunnerError(f"{self.name} timed out after {self.timeout} seconds", result=result)
+        if process.returncode != 0:
             raise RunnerError(
-                f"{self.name} exited with code {completed.returncode}: {completed.stderr.strip()}",
+                f"{self.name} exited with code {process.returncode}: {stderr.strip()}",
                 result=result,
             )
         return result
@@ -101,7 +156,8 @@ class CLIAgentRunner(AgentRunner):
                 "--tools",
                 tools,
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "-p",
                 "--",
                 prompt,
@@ -123,16 +179,20 @@ class CLIAgentRunner(AgentRunner):
 
     def _version(self, executable: str) -> str | None:
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [executable, "--version"],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=10,
-                check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+            stdout, stderr = process.communicate(timeout=10)
+        except OSError:
             return None
-        return (result.stdout or result.stderr).strip() or None
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return None
+        return (stdout or stderr).strip() or None
 
 
 def configured_runner(settings: WikiSettings, name: str) -> CLIAgentRunner:
@@ -145,7 +205,7 @@ def configured_runner(settings: WikiSettings, name: str) -> CLIAgentRunner:
 
 def _parse_usage(runner: str, stdout: str) -> dict[str, int | None]:
     envelopes: list[TelemetryEnvelope] = []
-    candidates = [stdout] if runner == "claude" else stdout.splitlines()
+    candidates = stdout.splitlines()
     for candidate in candidates:
         try:
             envelopes.append(TelemetryEnvelope.model_validate_json(candidate))
@@ -159,3 +219,21 @@ def _parse_usage(runner: str, stdout: str) -> dict[str, int | None]:
         "output_tokens": usage.output_tokens,
         "cached_input_tokens": usage.cached_input_tokens or usage.cache_read_input_tokens,
     }
+
+
+def _safe_progress_event(line: str) -> dict[str, object] | None:
+    """Reduce runner JSONL to operational metadata; never expose model text/reasoning."""
+    try:
+        payload = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or payload.get("subtype") or "")
+    if event_type in {"turn.started", "system", "init"}:
+        return {"phase": "model-started"}
+    if event_type in {"item.completed", "tool_use", "tool_result"}:
+        return {"phase": "model-working"}
+    if event_type in {"turn.completed", "result", "success"}:
+        return {"phase": "model-completed"}
+    return None

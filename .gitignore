@@ -2,6 +2,7 @@
 /.serena/
 /.venv/
 /Inbound/
+/my-knowledge/
 
 .env
 *.env

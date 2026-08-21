@@ -5,7 +5,13 @@ REVISE_PROMPT_VERSION = "wiki-first-revise-v1"
 QUERY_PROMPT_VERSION = "wiki-first-query-v1"
 
 
-def ingest_prompt(*, language: str, source_names: list[str], existing: bool) -> str:
+def ingest_prompt(
+    *,
+    language: str,
+    source_names: list[str],
+    existing: bool,
+    selected_pages: list[str] | None = None,
+) -> str:
     mode = (
         "An active Wiki has been copied into wiki/. Preserve useful existing knowledge and "
         "integrate the new material into it."
@@ -24,7 +30,10 @@ open questions, contradictions, and relations to the existing Wiki.
 NEW SOURCES:
 {listed}
 
-You may read any existing file under wiki/ and sources/. Edit only wiki/ and proposal-report.md.
+The retrieval layer supplied only relevant existing pages ({", ".join(selected_pages or [])}).
+Other active pages intentionally are not present and will be preserved by deterministic merge.
+You may read any supplied file under wiki/ and sources/. Edit only wiki/, proposal-report.md, and
+proposal-actions.json.
 Never edit sources/. Do not use the Internet or outside knowledge.
 
 The result is not one summary per source and not a claim database. Prefer a small set of durable,
@@ -51,7 +60,9 @@ Before finishing, reread the whole Wiki, merge duplicates, resolve every Wiki li
 citation and source path, and remove unsupported additions. Write proposal-report.md describing:
 sources read; pages created, changed, or removed; major synthesis decisions; conflicts and
 uncertainties; ignored low-value material; and self-check results. Finish the files—do not merely
-propose a structure.
+propose a structure. Write proposal-actions.json as strict JSON with an "actions" array. Each item
+has action "upsert", "delete", or "rename", path, and destination only for rename. List every
+created/changed page as upsert; deletions and renames happen only through this explicit manifest.
 """
 
 
@@ -69,11 +80,15 @@ this revision and run a complete self-check. Do not just explain what you would 
 """
 
 
-def query_prompt(question: str) -> str:
-    return f"""Answer the user's question by navigating the active Wiki in wiki/. Start with text
-search and the smallest relevant set of pages; follow [[links]] when helpful. Open files under
-sources/ only when the Wiki is insufficient or a claim needs verification. The Wiki and sources
-are read-only. Do not use outside knowledge.
+def query_prompt(question: str, *, context: str = "") -> str:
+    history = (
+        f"\nRECENT CHAT CONTEXT (context for the question, never evidence):\n{context}\n"
+        if context
+        else ""
+    )
+    return f"""Answer the user's question using only the retrieval-selected Wiki pages in wiki/.
+Open supplied files under sources/ when a claim needs verification. Absence of other pages is
+intentional; never search outside this directory or use outside knowledge.{history}
 
 QUESTION:
 {question.strip()}

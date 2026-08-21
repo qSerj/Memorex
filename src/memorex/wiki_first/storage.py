@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
+import shutil
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -98,7 +102,25 @@ CREATE TABLE IF NOT EXISTS answers (
     model TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES chat_sessions(id),
+    role TEXT NOT NULL, content TEXT NOT NULL, snapshot_id TEXT REFERENCES snapshots(id),
+    runner TEXT, model TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_events (
+    id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, job_id TEXT, phase TEXT NOT NULL,
+    payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+    slug UNINDEXED, title, text, links, backlinks, tokenize='unicode61'
+);
 """
+
+WIKI_LINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]*)\]\]")
+WORD = re.compile(r"[^\W_]{3,}", re.UNICODE)
 
 
 def utc_now() -> str:
@@ -126,6 +148,7 @@ class WikiStorage:
         with self.connection() as connection:
             connection.executescript(SCHEMA)
             self._ensure_runner_call_columns(connection)
+            self._ensure_proposal_columns(connection)
             active = connection.execute(
                 "SELECT snapshot_id FROM activations ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -149,6 +172,8 @@ class WikiStorage:
                     "VALUES (?, NULL, 'initialize', ?)",
                     (snapshot_id, now),
                 )
+        self.rebuild_fts()
+        self.sync_vault()
         return {"root": str(self.root), "snapshot": self.active_snapshot()["id"]}
 
     @contextmanager
@@ -300,11 +325,11 @@ class WikiStorage:
         return self.get_job(job_id)
 
     def recover_interrupted_jobs(self) -> int:
-        """Fail synchronous jobs left running by a terminated CLI process."""
+        """Mark jobs abandoned by a terminated process as retryable."""
         with self.connection() as connection:
             cursor = connection.execute(
                 "UPDATE jobs SET status = 'failed', "
-                "rejection_reason = 'interrupted CLI process', updated_at = ? "
+                "rejection_reason = 'server or CLI process was interrupted', updated_at = ? "
                 "WHERE status = 'running'",
                 (utc_now(),),
             )
@@ -333,12 +358,24 @@ class WikiStorage:
         tree_hash: str,
         validation_json: str,
         feedback: str | None,
+        retrieval_json: str = "{}",
     ) -> None:
         now = utc_now()
         with self.connection() as connection:
             connection.execute(
-                "INSERT INTO proposal_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (job_id, revision_no, relative_path, tree_hash, feedback, validation_json, now),
+                "INSERT INTO proposal_revisions(job_id, revision_no, relative_path, tree_hash, "
+                "feedback, validation_json, created_at, retrieval_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    revision_no,
+                    relative_path,
+                    tree_hash,
+                    feedback,
+                    validation_json,
+                    now,
+                    retrieval_json,
+                ),
             )
             connection.execute(
                 "UPDATE jobs SET status = 'proposed', current_revision = ?, updated_at = ? "
@@ -426,11 +463,26 @@ class WikiStorage:
                 (reason, utc_now(), job_id),
             )
 
+    def cancel_job(self, job_id: str, reason: str = "stopped by user") -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'cancelled', rejection_reason = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                (reason, utc_now(), job_id),
+            )
+
     def set_job_runner(self, job_id: str, runner: str) -> None:
         with self.connection() as connection:
             connection.execute(
                 "UPDATE jobs SET runner = ?, updated_at = ? WHERE id = ?",
                 (runner, utc_now(), job_id),
+            )
+
+    def set_job_status(self, job_id: str, status: str) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
+                (status, utc_now(), job_id),
             )
 
     def rollback(self, snapshot_id: str) -> None:
@@ -453,8 +505,11 @@ class WikiStorage:
         with self.connection() as connection:
             rows = connection.execute(
                 "SELECT a.id AS activation_id, a.snapshot_id, a.previous_snapshot_id, "
-                "a.reason, a.created_at, s.tree_hash FROM activations a "
-                "JOIN snapshots s ON s.id = a.snapshot_id ORDER BY a.id DESC"
+                "a.reason, a.created_at, s.tree_hash, rc.runner, rc.model, rc.duration_ms, "
+                "rc.input_tokens, rc.output_tokens FROM activations a "
+                "JOIN snapshots s ON s.id = a.snapshot_id "
+                "LEFT JOIN runner_calls rc ON rc.id = (SELECT MAX(id) FROM runner_calls "
+                "WHERE job_id = s.source_job_id) ORDER BY a.id DESC"
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -489,6 +544,20 @@ class WikiStorage:
             "proposal": dict(proposal) if proposal else None,
         }
 
+    def jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_proposal(self) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM jobs WHERE status = 'proposed' ORDER BY updated_at DESC LIMIT 1"
+            ).fetchone()
+        return self.proposal(str(row["id"])) if row else None
+
     def verify_active(self) -> None:
         snapshot = self.active_snapshot()
         actual = hash_tree(self.snapshot_path(snapshot))
@@ -497,6 +566,169 @@ class WikiStorage:
                 "Active Wiki was modified outside Memorex; restore it with rollback "
                 "before continuing"
             )
+
+    def list_pages(self, snapshot: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        current = snapshot or self.active_snapshot()
+        wiki = self.snapshot_path(current) / "wiki"
+        result = []
+        for path in sorted(wiki.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            first = next(
+                (line[2:].strip() for line in text.splitlines() if line.startswith("# ")), path.stem
+            )
+            result.append({"slug": path.stem, "title": first, "text": text, "path": path})
+        return result
+
+    def rebuild_fts(self) -> None:
+        if not self.database_path.exists():
+            return
+        pages = self.list_pages()
+        outbound = {str(p["slug"]): set(WIKI_LINK.findall(str(p["text"]))) for p in pages}
+        inbound: dict[str, set[str]] = {str(p["slug"]): set() for p in pages}
+        for source, targets in outbound.items():
+            for target in targets:
+                if target in inbound:
+                    inbound[target].add(source)
+        with self.connection() as connection:
+            connection.execute("DELETE FROM wiki_fts")
+            connection.executemany(
+                "INSERT INTO wiki_fts(slug,title,text,links,backlinks) VALUES (?,?,?,?,?)",
+                [
+                    (
+                        p["slug"],
+                        p["title"],
+                        p["text"],
+                        " ".join(sorted(outbound[str(p["slug"])])),
+                        " ".join(sorted(inbound[str(p["slug"])])),
+                    )
+                    for p in pages
+                ],
+            )
+
+    def search_pages(self, text: str, *, limit: int, related_limit: int) -> list[str]:
+        terms = []
+        for term in WORD.findall(text.lower()):
+            if term not in terms:
+                terms.append(term)
+        if not terms:
+            return []
+        query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms[:24])
+        with self.connection() as connection:
+            try:
+                rows = connection.execute(
+                    "SELECT slug, links, backlinks FROM wiki_fts WHERE wiki_fts MATCH ? "
+                    "ORDER BY bm25(wiki_fts) LIMIT ?",
+                    (query, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        selected = [str(row["slug"]) for row in rows]
+        for row in rows:
+            for slug in (str(row["links"]) + " " + str(row["backlinks"])).split():
+                if slug not in selected and len(selected) < limit + related_limit:
+                    selected.append(slug)
+        return selected
+
+    def add_task_event(
+        self, task_id: str, phase: str, payload: dict[str, object], job_id: str | None = None
+    ) -> None:
+        safe = {
+            key: value
+            for key, value in payload.items()
+            if key
+            in {
+                "phase",
+                "runner",
+                "model",
+                "elapsed_ms",
+                "fallback",
+                "sources",
+                "selected_pages",
+                "selected_count",
+                "total_pages",
+                "message",
+                "status",
+                "job_id",
+            }
+        }
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO task_events(task_id,job_id,phase,payload_json,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (task_id, job_id, phase, json.dumps(safe, ensure_ascii=False), utc_now()),
+            )
+
+    def task_events(self, task_id: str, after: int = 0) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id",
+                (task_id, after),
+            ).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
+
+    def create_chat(self, title: str) -> str:
+        session_id = uuid.uuid4().hex[:12]
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO chat_sessions VALUES (?,?,?,?)", (session_id, title[:120], now, now)
+            )
+        return session_id
+
+    def add_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        snapshot_id: str | None = None,
+        runner: str | None = None,
+        model: str | None = None,
+    ) -> int:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "INSERT INTO chat_messages(session_id,role,content,snapshot_id,runner,model,"
+                "created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (session_id, role, content, snapshot_id, runner, model, utc_now()),
+            )
+            connection.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (utc_now(), session_id)
+            )
+            return int(cursor.lastrowid)
+
+    def chat_sessions(self) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM chat_sessions ORDER BY updated_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def chat_messages(self, session_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM (SELECT * FROM chat_messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?) "
+                "ORDER BY id",
+                (session_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def sync_vault(self) -> Path:
+        snapshot = self.active_snapshot()
+        source = self.snapshot_path(snapshot)
+        vault = self.settings.root / "vault"
+        staging = self.settings.root / f".vault-next-{uuid.uuid4().hex[:8]}"
+        shutil.copytree(source, staging)
+        make_tree_read_only(staging)
+        old = self.settings.root / f".vault-old-{uuid.uuid4().hex[:8]}"
+        if vault.exists():
+            make_tree_writable(vault)
+            vault.rename(old)
+        staging.rename(vault)
+        if old.exists():
+            shutil.rmtree(old)
+        return vault
 
     def _store_bytes(self, data: bytes, checksum: str, namespace: str) -> Path:
         target = self.objects_dir / namespace / checksum[:2] / checksum
@@ -518,6 +750,16 @@ class WikiStorage:
             if name not in columns:
                 connection.execute(f"ALTER TABLE runner_calls ADD COLUMN {name} INTEGER")
 
+    def _ensure_proposal_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(proposal_revisions)")
+        }
+        if "retrieval_json" not in columns:
+            connection.execute(
+                "ALTER TABLE proposal_revisions ADD COLUMN retrieval_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            )
+
 
 def hash_tree(root: Path) -> str:
     digest = hashlib.sha256()
@@ -536,3 +778,9 @@ def make_tree_read_only(root: Path) -> None:
     for path in root.rglob("*"):
         path.chmod(0o555 if path.is_dir() else 0o444)
     root.chmod(0o555)
+
+
+def make_tree_writable(root: Path) -> None:
+    root.chmod(0o755)
+    for path in root.rglob("*"):
+        path.chmod(0o755 if path.is_dir() else 0o644)

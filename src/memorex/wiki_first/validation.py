@@ -93,11 +93,12 @@ def validate_wiki(
     if base_wiki is not None and base_wiki.exists():
         base_files = [path for path in base_wiki.rglob("*.md") if path.is_file()]
         base_total = sum(path.stat().st_size for path in base_files)
-        if base_total and total > base_total * 1.5:
+        meaningful_base = [path for path in base_files if path.name != "README.md"]
+        if meaningful_base and base_total >= 512 and total > base_total * 1.5:
             warnings.append(
                 f"Wiki grew by more than 50% ({base_total} -> {total} bytes); review for bloat"
             )
-        if base_files and len(markdown) > len(base_files) * 1.5:
+        if meaningful_base and len(markdown) > len(base_files) * 1.5:
             warnings.append(
                 f"Page count grew by more than 50% ({len(base_files)} -> {len(markdown)})"
             )

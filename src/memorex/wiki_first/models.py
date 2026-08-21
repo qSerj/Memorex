@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 @dataclass(frozen=True)
@@ -44,3 +49,29 @@ class AgentRunner:
 
     def run(self, workdir: Path, prompt: str, *, writable: bool) -> RunnerResult:
         raise NotImplementedError
+
+    def run_with_progress(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        writable: bool,
+        progress: Callable[[dict[str, object]], None] | None = None,
+        cancel_event: Event | None = None,
+    ) -> RunnerResult:
+        """Compatibility hook for streaming runners and simple test doubles."""
+        return self.run(workdir, prompt, writable=writable)
+
+
+class ProposalAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["upsert", "delete", "rename"]
+    path: str
+    destination: str | None = None
+
+
+class ProposalActions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[ProposalAction] = Field(default_factory=list)
