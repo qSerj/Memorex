@@ -1,6 +1,10 @@
-.memorex/
-.venv/
+/.memorex/
+/.serena/
+/.venv/
+/Inbound/
+
 .env
+*.env
 openrouter.env.sh
 __pycache__/
 *.py[cod]

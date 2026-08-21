@@ -1,101 +1,131 @@
 # Memorex
 
-Memorex — локальный knowledge compiler с проверяемым происхождением знаний. Он не
-подменяет источники сгенерированной Wiki: сохраняет неизменяемые оригиналы, извлекает
-атомарные утверждения с точными цитатами, отдельно хранит сущности, связи, решения и
-пользовательские исправления, а Markdown/веб-интерфейс считает производными представлениями.
+Memorex проверяет Wiki-first гипотезу: может ли сильная LLM превращать реальные неопрятные
+TXT/Markdown-материалы в постепенно растущую связанную Wiki, которую полезно читать и по которой
+можно задавать вопросы.
 
-Рабочий вертикальный сценарий v0.2 рассчитан на коллекцию TXT/Markdown-файлов: диалоги,
-заметки и внешние материалы превращаются в досье с проблемами, целями, идеями,
-предложенными, действующими, отклонёнными и заменёнными решениями.
+Новый путь сознательно короткий:
 
-## Почему это не просто `raw/ → wiki/index.md`
+```text
+checksum + immutable raw → целостные документы → сильный LLM-администратор
+                         → reviewable Markdown proposal → immutable Wiki snapshot
+                         → LLM-навигация и ответ
+```
 
-- Новые и изменённые файлы определяются по SHA-256, а не рассуждением модели.
-- Каждый проект — изолированный workspace со своей SQLite-базой и object store.
-- LLM вызывается только после заполнения метаданных и явного нажатия «Обработать».
-- Любой claim привязан к точному диапазону символов в неизменяемой версии источника.
-- Summary — производный текст, он никогда не становится evidence.
-- Противоречия и замена старого решения создают proposals; изменение графа требует review.
-- Исправления пользователя авторитетнее машинного извлечения, имеют причину и историю.
-- Поиск не читает единый растущий `index.md`: первичный retrieval выполняет SQLite FTS5.
-- Кандидатные модели можно сравнивать в изолированном eval, не загрязняя рабочие знания.
+Существующий provenance-oriented compiler с claims, exact evidence, graph review, eval и Web UI не
+удалён. Он сохранён как отдельный прототип и по-прежнему доступен через старые команды. Wiki-first
+не зависит от его онтологии или таблиц.
 
-## Быстрый старт с OpenRouter
+## Быстрый старт Wiki-first
 
-Требуются Python 3.13, `uv` и SQLite с FTS5.
+Требуются Python 3.13, `uv` и авторизованный Claude Code или Codex CLI. По умолчанию semantic ingest
+выполняет Claude Opus с максимальным effort, query — Codex `gpt-5.6-sol` с максимальным reasoning.
+Если основной ingest-runner технически завершается ошибкой или выдаёт невалидную Wiki, Memorex один
+раз пробует второй сильный runner. GigaChat пока не исключён из будущих исследований, но не входит в
+runtime fallback первой версии.
 
 ```bash
 uv sync --locked --all-groups
+uv run memorex workspace init ./my-knowledge --name "Моя база"
 
+cp meeting.txt ./my-knowledge/inbox/
+cp notes.md ./my-knowledge/inbox/
+
+uv run memorex --workspace ./my-knowledge wiki ingest
+uv run memorex --workspace ./my-knowledge wiki review JOB_ID --diff
+uv run memorex --workspace ./my-knowledge wiki revise JOB_ID \
+  "Слишком много мелких страниц; объедини повторяющиеся темы"
+uv run memorex --workspace ./my-knowledge wiki apply JOB_ID
+uv run memorex --workspace ./my-knowledge wiki ask \
+  "Почему мы изменили подход к лаборатории моделей?"
+```
+
+Перед ingest не нужно заполнять title, author, date, type или authority. В первой версии принимаются
+UTF-8 `.txt` и `.md`; модель читает каждый файл целиком и сама извлекает полезный контекст. Команда
+`wiki tell` тем же reviewable путём передаёт Wiki произвольную мысль, поправку или предпочтение:
+
+```bash
+uv run memorex --workspace ./my-knowledge wiki tell \
+  "Считай стоимость важнее скорости, пока я явно не изменю этот приоритет"
+```
+
+Ни ingest, ни tell не меняют активную базу автоматически. Они создают proposal. `apply` проверяет
+Markdown-контракт и неизменность базового snapshot, затем атомарно активирует всю версию. Доступны
+`wiki reject`, `wiki history`, `wiki rollback`, `wiki validate` и `wiki status`.
+
+`wiki status` печатает абсолютный путь активной read-only Wiki. Эту папку удобно открыть в Obsidian
+как диагностический vault. Редактировать её руками не следует: Memorex проверяет hash дерева и
+остановит ingest/query после внешнего изменения. Поправки нужно передавать через `wiki tell` или
+`wiki revise`.
+
+## Workspace и конфигурация
+
+```text
+my-knowledge/
+├── memorex.toml
+├── inbox/                         # пользователь кладёт TXT/Markdown сюда
+└── .memorex/
+    ├── memorex.db                 # сохранённый provenance-compiler
+    └── wiki-first/
+        ├── state.sqlite           # checksum, jobs, snapshots, activations, calls
+        ├── objects/               # immutable raw и normalized objects
+        ├── jobs/                  # proposal revisions
+        ├── snapshots/             # immutable Wiki versions + source views
+        └── answers/               # производные ответы, не evidence
+```
+
+Настройки runner находятся в `memorex.toml` и не содержат секретов:
+
+```toml
+[wiki]
+ingest_runner = "claude"
+query_runner = "codex"
+claude_model = "opus"
+claude_effort = "max"
+codex_model = "gpt-5.6-sol"
+codex_reasoning_effort = "max"
+```
+
+Для разового сравнения можно передать `--runner claude` или `--runner codex` в `wiki ingest`,
+`wiki revise` и `wiki ask`.
+
+## Что проверяет первая версия
+
+- deterministic discovery по path/checksum и идемпотентный re-ingest;
+- неизменяемые raw/normalized objects;
+- понимание целого документа вместо обязательного `2000 chars → claims`;
+- обновление тематических страниц, cross-links, несколько источников у synthesis;
+- ручной review/revise/apply без прямого редактирования внутренней Wiki;
+- immutable snapshots, stale-proposal guard, integrity check и rollback;
+- лог runner/model/version/prompt/duration/errors без секретов;
+- query через Wiki, с возможностью открыть raw sources, но без превращения ответа в знание.
+
+Синтетический публичный benchmark и протокол лежат в
+[`experiments/wiki_first`](experiments/wiki_first/README.md). Точные Wiki по приватному корпусу
+сохранены отдельно и не коммитятся; tracked recovery metadata находится в
+[`PRIVATE_REFERENCES.md`](experiments/wiki_first/PRIVATE_REFERENCES.md).
+
+## Сохранённый provenance compiler
+
+Старый вертикальный путь остаётся доступен для исследований factual QA:
+
+```bash
 export MEMOREX_LLM_BASE_URL=https://openrouter.ai/api/v1
 export MEMOREX_LLM_API_KEY=ваш_ключ
 
-uv run memorex workspace init ./my-knowledge --name "Моя база"
 uv run memorex --workspace ./my-knowledge workspace models \
   --fast openai/gpt-4.1-mini \
   --strong openai/gpt-4.1 \
   --answer openai/gpt-4.1-mini
 
+uv run memorex --workspace ./my-knowledge inbox scan
 uv run memorex serve ./my-knowledge
 ```
 
-Откройте `http://127.0.0.1:8765`, положите `.txt` или `.md` в
-`my-knowledge/inbox/`, задайте тип, автора, доверенность и дату источника, затем
-подтвердите платную обработку. Inbox обновляется автоматически, пока страница открыта.
-
-Секреты не записываются в `memorex.toml`. Если переменные лежат в bash-файле:
-
-```bash
-source ./openrouter.env.sh
-```
-
-В самом файле должны быть строки `export MEMOREX_LLM_BASE_URL=...`,
-`export MEMOREX_LLM_API_KEY=...`; ключ нельзя коммитить.
-
-## Тот же workflow через CLI
-
-```bash
-uv run memorex --workspace ./my-knowledge inbox scan --json
-uv run memorex --workspace ./my-knowledge inbox metadata 1 \
-  --title "Разговор о продукте" --kind conversation --authority primary \
-  --author "Иван" --from 2026-08-21 --tag business
-uv run memorex --workspace ./my-knowledge inbox compile 1
-uv run memorex --workspace ./my-knowledge dossier
-uv run memorex --workspace ./my-knowledge ask "Почему мы отказались от первой идеи?"
-```
-
-Ручной model eval на одинаковых сегментах:
-
-```bash
-uv run memorex --workspace ./my-knowledge eval run 1 \
-  --model openai/gpt-4.1-mini --model qwen/qwen3-30b-a3b
-```
-
-Eval проверяет strict schema, точность evidence и стоимость токенов/времени, но не
-активирует полученные claims.
-
-## Данные workspace
-
-```text
-my-knowledge/
-├── memorex.toml            # имя, язык и роли моделей; без ключей
-├── inbox/                  # контролируемая staging-зона
-└── .memorex/               # runtime, не коммитить
-    ├── memorex.db          # registry, claims, graph, review, eval
-    └── objects/ab/<sha256> # неизменяемые snapshots источников
-```
-
-Перемещение уже обработанного файла распознаётся по checksum, если оно однозначно;
-изменение содержимого создаёт новую revision. После прерванной обработки запись inbox
-возвращается в состояние, из которого её можно безопасно повторить.
-
-## Legacy CLI
-
-Низкоуровневые команды первой итерации (`init`, `add`, `extract`, `claim`, `ask`)
-сохранены для диагностики и обратной совместимости. Для реального использования лучше
-создавать workspace и работать через `inbox compile`: этот pipeline извлекает типы
-решений, сущности, связи и summaries.
+Он использует metadata gate, атомарные claims, exact evidence, typed relations, proposals,
+overrides, FTS5, eval и Web UI. Эти механизмы не считаются удалёнными или плохими; они временно не
+являются центром продуктового эксперимента. Состояние до поворота дополнительно отмечено Git-тегом
+`provenance-compiler-prototype`.
 
 ## Разработка
 
@@ -105,8 +135,7 @@ uv run ruff format --check .
 uv run pytest
 ```
 
-Тесты полностью офлайн и используют fake LLM providers. Реальный endpoint smoke test
-должен выполняться только на несекретном тексте.
+Тесты полностью офлайн и используют fake runners/providers. Реальные agent CLI можно запускать
+только на несекретном корпусе либо в приватном ignored workspace.
 
-Проектные решения описаны в `00_PROJECT_CONTEXT.md`–`04_OPEN_QUESTIONS.md`, актуальный
-срез реализации — в [`05_IMPLEMENTATION_STATUS.md`](05_IMPLEMENTATION_STATUS.md).
+Текущий срез архитектуры описан в [`05_IMPLEMENTATION_STATUS.md`](05_IMPLEMENTATION_STATUS.md).

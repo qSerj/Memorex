@@ -16,6 +16,8 @@ from memorex.ingest import SourceValidationError, parse_source
 from memorex.llm import OpenAICompatibleProvider
 from memorex.query import QueryError, answer_question
 from memorex.storage import RecordNotFound, Storage, WorkspaceNotInitialized
+from memorex.wiki_first import WikiFirstService
+from memorex.wiki_first.runners import RunnerError
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 source_app = typer.Typer(no_args_is_help=True)
@@ -23,11 +25,13 @@ claim_app = typer.Typer(no_args_is_help=True)
 workspace_app = typer.Typer(no_args_is_help=True)
 inbox_app = typer.Typer(no_args_is_help=True)
 evaluation_app = typer.Typer(no_args_is_help=True)
+wiki_app = typer.Typer(no_args_is_help=True)
 app.add_typer(source_app, name="source")
 app.add_typer(claim_app, name="claim")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(inbox_app, name="inbox")
 app.add_typer(evaluation_app, name="eval")
+app.add_typer(wiki_app, name="wiki")
 
 
 @dataclass
@@ -52,7 +56,7 @@ def main(
         typer.Option("--workspace", help="Memorex workspace root containing memorex.toml."),
     ] = None,
 ) -> None:
-    """Compile local source files into reusable, provenance-backed knowledge."""
+    """Build a local LLM-administered Wiki or use the preserved knowledge compiler."""
     if workspace_root is not None:
         settings = WorkspaceSettings.load(workspace_root)
         ctx.obj = CLIState(settings.data, settings)
@@ -72,11 +76,13 @@ def workspace_init(
     def action() -> dict[str, Any]:
         settings = WorkspaceSettings.create(path, name or path.name, language=language)
         initialized = Storage(settings.data).initialize()
+        wiki = WikiFirstService(settings).initialize()
         return {
             **initialized,
             "workspace_root": str(settings.root),
             "name": settings.name,
             "inbox": str(settings.inbox_dir),
+            "wiki_snapshot": wiki["snapshot"],
         }
 
     _run(action, json_output, _format_workspace_init)
@@ -109,6 +115,188 @@ def workspace_models(
         lambda result: (
             f"Models: fast={result['fast']}, strong={result['strong']}, answer={result['answer']}"
         ),
+    )
+
+
+def _wiki_service(ctx: typer.Context) -> WikiFirstService:
+    state = _state(ctx)
+    if state.settings is None:
+        raise ConfigurationError("Wiki-first commands require --workspace PATH")
+    return WikiFirstService(state.settings)
+
+
+@wiki_app.command("status")
+def wiki_status(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Show the active Wiki snapshot, integrity, and pending proposal."""
+    _run(lambda: _wiki_service(ctx).status(), json_output, _format_wiki_status)
+
+
+@wiki_app.command("ingest")
+def wiki_ingest(
+    ctx: typer.Context,
+    runner: Annotated[str | None, typer.Option("--runner", help="claude or codex")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Discover TXT/Markdown sources and build a reviewable Wiki proposal."""
+    _run(
+        lambda: _wiki_service(ctx).ingest(runner_name=runner),
+        json_output,
+        _format_wiki_proposal,
+    )
+
+
+@wiki_app.command("tell")
+def wiki_tell(
+    ctx: typer.Context,
+    text: Annotated[
+        str | None, typer.Argument(help="A thought, correction, or instruction.")
+    ] = None,
+    stdin: Annotated[
+        bool, typer.Option("--stdin", help="Read the note from standard input.")
+    ] = False,
+    runner: Annotated[str | None, typer.Option("--runner", help="claude or codex")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Offer a user-authored thought to the Wiki administrator."""
+    if stdin:
+        import sys
+
+        text = sys.stdin.read()
+    if text is None:
+        raise typer.BadParameter("Provide TEXT or use --stdin")
+    _run(
+        lambda: _wiki_service(ctx).tell(text, runner_name=runner),
+        json_output,
+        _format_wiki_proposal,
+    )
+
+
+@wiki_app.command("review")
+def wiki_review(
+    ctx: typer.Context,
+    job_id: Annotated[str, typer.Argument()],
+    diff: Annotated[
+        bool, typer.Option("--diff", help="Include the unified Markdown diff.")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Inspect a pending proposal report, validation, and optional diff."""
+
+    def action() -> dict[str, Any]:
+        result = _wiki_service(ctx).review(job_id)
+        if not diff and not json_output:
+            result = {**result, "diff": ""}
+        return result
+
+    _run(action, json_output, _format_wiki_review)
+
+
+@wiki_app.command("revise")
+def wiki_revise(
+    ctx: typer.Context,
+    job_id: Annotated[str, typer.Argument()],
+    feedback: Annotated[str, typer.Argument(help="Natural-language revision request.")],
+    runner: Annotated[str | None, typer.Option("--runner", help="claude or codex")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Ask the semantic administrator to revise a pending proposal."""
+    _run(
+        lambda: _wiki_service(ctx).revise(job_id, feedback, runner_name=runner),
+        json_output,
+        _format_wiki_proposal,
+    )
+
+
+@wiki_app.command("apply")
+def wiki_apply(
+    ctx: typer.Context,
+    job_id: Annotated[str, typer.Argument()],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Atomically activate a validated Wiki proposal."""
+    _run(
+        lambda: _wiki_service(ctx).apply(job_id),
+        json_output,
+        lambda result: (
+            f"Applied {result['job_id']} as snapshot {result['snapshot']}\n"
+            f"Read-only Wiki: {result['wiki_path']}"
+        ),
+    )
+
+
+@wiki_app.command("reject")
+def wiki_reject(
+    ctx: typer.Context,
+    job_id: Annotated[str, typer.Argument()],
+    reason: Annotated[str, typer.Option("--reason")] = "rejected by administrator",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Reject a pending proposal without consuming its sources."""
+    _run(
+        lambda: _wiki_service(ctx).reject(job_id, reason),
+        json_output,
+        lambda result: f"Rejected {result['job_id']}: {result['reason']}",
+    )
+
+
+@wiki_app.command("ask")
+def wiki_ask(
+    ctx: typer.Context,
+    question: Annotated[str, typer.Argument()],
+    runner: Annotated[str | None, typer.Option("--runner", help="claude or codex")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Navigate the active Wiki and answer without modifying knowledge."""
+    _run(
+        lambda: _wiki_service(ctx).ask(question, runner_name=runner),
+        json_output,
+        lambda result: str(result["answer"]),
+    )
+
+
+@wiki_app.command("history")
+def wiki_history(
+    ctx: typer.Context,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """List immutable Wiki activations."""
+    _run(
+        lambda: _wiki_service(ctx).history(),
+        json_output,
+        lambda rows: "\n".join(
+            f"{row['snapshot_id']}\t{row['created_at']}\t{row['reason']}" for row in rows
+        ),
+    )
+
+
+@wiki_app.command("rollback")
+def wiki_rollback(
+    ctx: typer.Context,
+    snapshot_id: Annotated[str, typer.Argument()],
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Reactivate an earlier immutable Wiki snapshot."""
+    _run(
+        lambda: _wiki_service(ctx).rollback(snapshot_id),
+        json_output,
+        lambda result: f"Active snapshot: {result['snapshot']}\nWiki: {result['wiki_path']}",
+    )
+
+
+@wiki_app.command("validate")
+def wiki_validate(
+    ctx: typer.Context,
+    job_id: Annotated[str | None, typer.Argument()] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Validate a proposal or the active Wiki deterministically."""
+    _run(
+        lambda: _wiki_service(ctx).validate(job_id),
+        json_output,
+        lambda result: json.dumps(result, ensure_ascii=False, indent=2),
     )
 
 
@@ -403,6 +591,7 @@ def _run(action: Any, json_output: bool, formatter: Any) -> None:
         QueryError,
         RecordNotFound,
         SourceValidationError,
+        RunnerError,
         WorkspaceNotInitialized,
         ValueError,
     ) as exc:
@@ -423,6 +612,56 @@ def _format_workspace_init(result: dict[str, Any]) -> str:
         f"Workspace {result['name']} initialized at {result['workspace_root']}\n"
         f"Inbox: {result['inbox']}"
     )
+
+
+def _format_wiki_status(result: dict[str, Any]) -> str:
+    proposal = result.get("proposal")
+    proposal_text = (
+        f"{proposal['id']} ({proposal['status']}, revision {proposal['current_revision']})"
+        if proposal
+        else "none"
+    )
+    return (
+        f"Active Wiki: {result['active_snapshot']} ({result['integrity']})\n"
+        f"Path: {result['wiki_path']}\n"
+        f"Pending sources: {result['pending_sources']}\n"
+        f"Proposal: {proposal_text}"
+    )
+
+
+def _format_wiki_proposal(result: dict[str, Any]) -> str:
+    if result["status"] == "unchanged":
+        return "No new or changed TXT/Markdown sources."
+    validation = result["validation"]
+    warnings = validation.get("warnings", [])
+    lines = [
+        f"Proposal {result['job_id']} revision {result['revision']} is ready.",
+        f"Runner: {result['runner']} ({result['model']}), {result['duration_ms']} ms",
+        f"Validation: {validation['pages']} pages, {len(warnings)} warnings",
+        f"Review: memorex wiki review {result['job_id']} --diff",
+        f"Apply: memorex wiki apply {result['job_id']}",
+    ]
+    if warnings:
+        lines.append("Warnings: " + "; ".join(warnings))
+    return "\n".join(lines)
+
+
+def _format_wiki_review(result: dict[str, Any]) -> str:
+    validation = result["validation"]
+    lines = [
+        f"Proposal {result['job_id']} revision {result['revision']} ({result['runner']})",
+        f"Validation: {'pass' if validation['valid'] else 'FAIL'}, "
+        f"{validation['pages']} pages, {validation['bytes']} bytes",
+    ]
+    if validation["errors"]:
+        lines.append("Errors:\n- " + "\n- ".join(validation["errors"]))
+    if validation["warnings"]:
+        lines.append("Warnings:\n- " + "\n- ".join(validation["warnings"]))
+    if result["report"]:
+        lines.append("\nReport:\n" + result["report"].strip())
+    if result["diff"]:
+        lines.append("\nDiff:\n" + result["diff"])
+    return "\n".join(lines)
 
 
 def _format_add(result: dict[str, Any]) -> str:

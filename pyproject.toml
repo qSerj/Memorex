@@ -1,7 +1,7 @@
 [project]
 name = "memorex"
 version = "0.2.0"
-description = "A local, provenance-first knowledge compiler"
+description = "A local LLM-administered knowledge Wiki and provenance compiler prototype"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

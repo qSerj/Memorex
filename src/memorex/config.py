@@ -31,6 +31,16 @@ class WorkspaceConfig:
 
 
 @dataclass(frozen=True)
+class WikiSettings:
+    ingest_runner: str = "claude"
+    query_runner: str = "codex"
+    claude_model: str = "opus"
+    claude_effort: str = "max"
+    codex_model: str = "gpt-5.6-sol"
+    codex_reasoning_effort: str = "max"
+
+
+@dataclass(frozen=True)
 class WorkspaceSettings:
     root: Path
     name: str
@@ -38,6 +48,7 @@ class WorkspaceSettings:
     fast_model: str | None
     strong_model: str | None
     answer_model: str | None
+    wiki: WikiSettings
 
     @property
     def data(self) -> WorkspaceConfig:
@@ -64,7 +75,14 @@ class WorkspaceSettings:
                 "[models]\n"
                 'fast = ""\n'
                 'strong = ""\n'
-                'answer = ""\n',
+                'answer = ""\n\n'
+                "[wiki]\n"
+                'ingest_runner = "claude"\n'
+                'query_runner = "codex"\n'
+                'claude_model = "opus"\n'
+                'claude_effort = "max"\n'
+                'codex_model = "gpt-5.6-sol"\n'
+                'codex_reasoning_effort = "max"\n',
                 encoding="utf-8",
             )
         return cls.load(resolved)
@@ -76,7 +94,8 @@ class WorkspaceSettings:
             "[models]\n"
             f"fast = {json.dumps(fast.strip(), ensure_ascii=False)}\n"
             f"strong = {json.dumps(strong.strip(), ensure_ascii=False)}\n"
-            f"answer = {json.dumps(answer.strip(), ensure_ascii=False)}\n",
+            f"answer = {json.dumps(answer.strip(), ensure_ascii=False)}\n\n"
+            f"{_render_wiki_settings(self.wiki)}",
             encoding="utf-8",
         )
         return self.load(self.root)
@@ -91,6 +110,7 @@ class WorkspaceSettings:
             )
         raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
         models = raw.get("models", {})
+        wiki = raw.get("wiki", {})
         return cls(
             root=resolved,
             name=str(raw.get("name") or resolved.name),
@@ -98,7 +118,28 @@ class WorkspaceSettings:
             fast_model=str(models.get("fast") or "") or None,
             strong_model=str(models.get("strong") or "") or None,
             answer_model=str(models.get("answer") or "") or None,
+            wiki=WikiSettings(
+                ingest_runner=str(wiki.get("ingest_runner") or "claude"),
+                query_runner=str(wiki.get("query_runner") or "codex"),
+                claude_model=str(wiki.get("claude_model") or "opus"),
+                claude_effort=str(wiki.get("claude_effort") or "max"),
+                codex_model=str(wiki.get("codex_model") or "gpt-5.6-sol"),
+                codex_reasoning_effort=str(wiki.get("codex_reasoning_effort") or "max"),
+            ),
         )
+
+
+def _render_wiki_settings(settings: WikiSettings) -> str:
+    return (
+        "[wiki]\n"
+        f"ingest_runner = {json.dumps(settings.ingest_runner)}\n"
+        f"query_runner = {json.dumps(settings.query_runner)}\n"
+        f"claude_model = {json.dumps(settings.claude_model)}\n"
+        f"claude_effort = {json.dumps(settings.claude_effort)}\n"
+        f"codex_model = {json.dumps(settings.codex_model)}\n"
+        "codex_reasoning_effort = "
+        f"{json.dumps(settings.codex_reasoning_effort)}\n"
+    )
 
 
 @dataclass(frozen=True)
