@@ -1,80 +1,70 @@
 # Implementation Status
 
-Updated: 2026-08-20
+Updated: 2026-08-21
 
 ## Current Milestone
 
-The first milestone is a deliberately thin end-to-end personal research CLI:
+Memorex v0.2 implements the first usable decision-knowledge workspace:
 
 ```text
-init → add → extract → inspect evidence → ask
+inbox → deterministic staging → user metadata/confirmation → LLM compilation
+      → claims + exact evidence + entities + relations + summaries
+      → decision dossier / reviewed graph / cited answers
 ```
 
-It validates the central project hypothesis: understanding extracted once can be
-stored as claims and reused for later answers without rereading the whole corpus.
-
-## Decisions Locked for v1
-
-- Python 3.13, `uv`, Typer, Pydantic, stdlib `sqlite3`; no ORM.
-- Explicit SQL behind a small `Storage` boundary and numbered migrations.
-- UTF-8 TXT and Markdown only; paragraph-aware, non-overlapping 2,000-character
-  segments with normalized-text offsets.
-- Source identity is canonical path. A changed checksum creates a revision; an
-  unchanged add is idempotent.
-- Immutable bytes live in `.memorex/objects/<sha256[:2]>/<sha256>`. The original
-  file is left untouched and the object store is never used for discovery.
-- Claims are atomic text plus confidence and one exact evidence quote. Entities,
-  triples, and ontology remain deferred.
-- LLM access uses an OpenAI-compatible `/v1/chat/completions` endpoint with strict
-  `json_schema`; there is no permissive JSON fallback.
-- `ask` retrieves active claims through FTS5/BM25, validates citation IDs, and does
-  not persist the resulting synthesis.
+The database is the machine-readable knowledge core. Generated summaries and the web
+view are rebuildable projections, not evidence.
 
 ## Implemented
 
-- Git repository initialized on `main`; GitHub `origin` uses
-  `git@github.com:qSerj/Memorex.git`.
-- Installable `memorex` package and Typer CLI with `init`, `add`, `source list/show`,
-  `extract`, `claim list/show`, and `ask` commands.
-- SQLite migrations, foreign keys, FTS5, source revisions, segments, jobs, LLM call
-  audit records, claims, and exact claim evidence.
-- Sharded content-addressed object storage with checksum verification and atomic
-  writes.
-- Strict Pydantic validation, verbatim evidence anchoring, three-attempt extraction
-  and answer validation, active extraction jobs, and `--force` rebuilds.
-- Human-readable and `--json` output modes.
-- GitHub Actions plus offline unit/integration/CLI tests using a fake LLM provider.
+- Isolated workspaces with `memorex.toml`, `inbox/`, private `.memorex/` state, and
+  independent model-role profiles.
+- Recursive TXT/Markdown discovery, SHA-256 identity, idempotent re-scan, changed-source
+  revisions, unambiguous move recognition, and recovery of interrupted inbox jobs.
+- Explicit metadata gate before any paid LLM processing.
+- Strict decision-aware structured extraction: observation, problem, goal, idea,
+  decision, action item; proposed/active/rejected/completed/unknown lifecycle.
+- Exact verbatim evidence offsets against normalized immutable source snapshots.
+- Entities, typed evidence-backed relations, claims-first source summaries, FTS5
+  retrieval, and cited answers.
+- Answer guard rejects unsupported content words, retries with validation feedback, and
+  falls back to verbatim cited claim text instead of returning embellished synthesis.
+- Strong-model proposals for contradiction and superseding. No graph mutation occurs
+  until human review; accepted claim links remain auditable.
+- Authoritative user overrides with reason and history. Runtime retrieval uses the
+  newest override and labels original evidence as pre-correction context.
+- Server-rendered local FastAPI UI for dashboard, staging, compilation, dossier,
+  evidence inspection, question answering, review, model roles, and eval.
+- Isolated model evaluation over identical segments; candidate output never activates
+  production claims.
+- OpenAI-compatible provider roles (`fast`, `strong`, `answer`), with OpenRouter as the
+  documented first configuration.
+- Automatic migrations from the v0.1 schema, CI, and offline fake-provider tests.
 
-At this checkpoint, `ruff check`, `ruff format --check`, and all 17 tests pass.
+## Integrity Rules
 
-## Continue From Another Machine
+- Source objects are immutable; reprocessing creates derived jobs, not rewritten evidence.
+- Synthesis never becomes evidence automatically.
+- Rejected claims do not enter retrieval; accepted superseded claims remain historical
+  but are excluded from current answers.
+- All model JSON is validated by Pydantic; there is no permissive fallback parser.
+- Secrets, workspace state, and private corpora are not committed.
 
-```bash
-git clone git@github.com:qSerj/Memorex.git
-cd Memorex
-uv sync --locked --all-groups
-uv run ruff check .
-uv run ruff format --check .
-uv run pytest
-```
+## Deliberately Deferred
 
-Then configure `MEMOREX_LLM_BASE_URL`, `MEMOREX_LLM_MODEL`, and optionally
-`MEMOREX_LLM_API_KEY`. No credentials or `.memorex` data are committed.
+- PDF/DOCX/HTML parsers and source-specific locators such as PDF page and bounding box.
+- Embeddings, graph community summaries, and a learned query router. FTS5 plus typed
+  graph data is sufficient to evaluate the first real corpus before adding these costs.
+- Automated entity merge. Ambiguous identity remains a review problem.
+- Full temporal interval reasoning beyond stored `valid_from`/`valid_to` fields.
+- Saved associative trails and generated Obsidian/Markdown Wiki views.
+- GigaChat adapter; the current boundary is OpenAI-compatible endpoints.
 
-## Next Work
+## Next Evidence-Driven Work
 
-1. Run the documented end-to-end smoke test against the intended real compatible
-   endpoint and model; record any compatibility differences around `json_schema`.
-2. Add a small non-sensitive fixture source and verify a real extracted claim can
-   be traced back to its exact normalized-text span.
-3. Exercise Russian and English questions against several sources, then tune prompts
-   and FTS token selection only from observed failures.
-4. Decide whether the next increment should add PDF parsing, hybrid segment fallback,
-   or entities. Do not implement these before the first real evaluation.
-
-## Known v1 Boundaries
-
-There is no inbox watcher, PDF parser, entity resolution, temporal claim model,
-embeddings, generated Wiki, saved answer/trail, web UI, or migration from another
-backend. Failed extraction jobs stay available for audit but never become active.
-
+1. Load the first real entrepreneur corpus and inspect extraction failures and review load.
+2. Run model eval across representative Russian conversations before choosing role models.
+3. Add PDF support with page-level provenance when the TXT/Markdown workflow is stable.
+4. Add hybrid/vector or hierarchical retrieval only if measured questions fail FTS/graph
+   retrieval; do not recreate a monolithic context index.
+5. Add saved Memex-style trails after repeated question paths appear in real usage.

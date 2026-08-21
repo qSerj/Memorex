@@ -190,6 +190,31 @@ def test_answer_rejects_unknown_citations_after_retries(tmp_path: Path) -> None:
         answer_question(storage, "What uses SQLite?", provider, llm_config())
 
 
+def test_answer_falls_back_to_claim_text_when_model_adds_unsupported_reason(
+    tmp_path: Path,
+) -> None:
+    storage, source_id = prepared_source(tmp_path)
+    extract_source(storage, source_id, FakeProvider([claim_output()]), llm_config())
+    claim_id = storage.list_claims(source_id)[0]["id"]
+    unsupported = json.dumps(
+        {
+            "answer": (
+                f"Memorex uses SQLite for local storage because it is universally superior "
+                f"[C{claim_id}]."
+            ),
+            "citations": [claim_id],
+        }
+    )
+    provider = FakeProvider([unsupported, unsupported, unsupported])
+
+    result = answer_question(storage, "What uses SQLite?", provider, llm_config())
+
+    assert result["status"] == "answered_extractively"
+    assert result["answer"] == (f"Memorex uses SQLite for local storage. [C{claim_id}]")
+    assert "universally superior" not in result["answer"]
+    assert "Previous response was rejected" in provider.calls[1]["messages"][1]["content"]
+
+
 def test_no_matches_skips_model_call(tmp_path: Path) -> None:
     storage, source_id = prepared_source(tmp_path)
     extract_source(storage, source_id, FakeProvider([claim_output()]), llm_config())

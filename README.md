@@ -1,52 +1,101 @@
 # Memorex
 
-Локальный provenance-first knowledge compiler. Memorex сохраняет неизменяемые копии
-источников, извлекает из них проверяемые claims и отвечает на вопросы только с
-ссылками на точные evidence spans.
+Memorex — локальный knowledge compiler с проверяемым происхождением знаний. Он не
+подменяет источники сгенерированной Wiki: сохраняет неизменяемые оригиналы, извлекает
+атомарные утверждения с точными цитатами, отдельно хранит сущности, связи, решения и
+пользовательские исправления, а Markdown/веб-интерфейс считает производными представлениями.
 
-Проект находится в первой рабочей итерации. Текущий статус и порядок продолжения
-описаны в [`05_IMPLEMENTATION_STATUS.md`](05_IMPLEMENTATION_STATUS.md).
+Рабочий вертикальный сценарий v0.2 рассчитан на коллекцию TXT/Markdown-файлов: диалоги,
+заметки и внешние материалы превращаются в досье с проблемами, целями, идеями,
+предложенными, действующими, отклонёнными и заменёнными решениями.
 
-## Быстрый старт
+## Почему это не просто `raw/ → wiki/index.md`
+
+- Новые и изменённые файлы определяются по SHA-256, а не рассуждением модели.
+- Каждый проект — изолированный workspace со своей SQLite-базой и object store.
+- LLM вызывается только после заполнения метаданных и явного нажатия «Обработать».
+- Любой claim привязан к точному диапазону символов в неизменяемой версии источника.
+- Summary — производный текст, он никогда не становится evidence.
+- Противоречия и замена старого решения создают proposals; изменение графа требует review.
+- Исправления пользователя авторитетнее машинного извлечения, имеют причину и историю.
+- Поиск не читает единый растущий `index.md`: первичный retrieval выполняет SQLite FTS5.
+- Кандидатные модели можно сравнивать в изолированном eval, не загрязняя рабочие знания.
+
+## Быстрый старт с OpenRouter
 
 Требуются Python 3.13, `uv` и SQLite с FTS5.
 
 ```bash
-uv sync
-uv run memorex init
-uv run memorex add path/to/source.md
-uv run memorex source list
+uv sync --locked --all-groups
+
+export MEMOREX_LLM_BASE_URL=https://openrouter.ai/api/v1
+export MEMOREX_LLM_API_KEY=ваш_ключ
+
+uv run memorex workspace init ./my-knowledge --name "Моя база"
+uv run memorex --workspace ./my-knowledge workspace models \
+  --fast openai/gpt-4.1-mini \
+  --strong openai/gpt-4.1 \
+  --answer openai/gpt-4.1-mini
+
+uv run memorex serve ./my-knowledge
 ```
 
-Для extraction и query нужен сервер с OpenAI-compatible Chat Completions API и
-поддержкой strict JSON Schema:
+Откройте `http://127.0.0.1:8765`, положите `.txt` или `.md` в
+`my-knowledge/inbox/`, задайте тип, автора, доверенность и дату источника, затем
+подтвердите платную обработку. Inbox обновляется автоматически, пока страница открыта.
+
+Секреты не записываются в `memorex.toml`. Если переменные лежат в bash-файле:
 
 ```bash
-export MEMOREX_LLM_BASE_URL=http://localhost:11434/v1
-export MEMOREX_LLM_MODEL=your-model
-# export MEMOREX_LLM_API_KEY=...  # если сервер требует ключ
-
-uv run memorex extract 1
-uv run memorex claim list --source 1
-uv run memorex claim show 1
-uv run memorex ask "Какое хранилище использует Memorex?"
+source ./openrouter.env.sh
 ```
 
-У всех команд просмотра есть `--json`. Другой каталог данных можно выбрать глобальным
-флагом `--data-dir` или переменной `MEMOREX_DATA_DIR`.
+В самом файле должны быть строки `export MEMOREX_LLM_BASE_URL=...`,
+`export MEMOREX_LLM_API_KEY=...`; ключ нельзя коммитить.
 
-## Локальное состояние
+## Тот же workflow через CLI
 
-По умолчанию рабочее состояние находится в `.memorex/` и не попадает в Git:
+```bash
+uv run memorex --workspace ./my-knowledge inbox scan --json
+uv run memorex --workspace ./my-knowledge inbox metadata 1 \
+  --title "Разговор о продукте" --kind conversation --authority primary \
+  --author "Иван" --from 2026-08-21 --tag business
+uv run memorex --workspace ./my-knowledge inbox compile 1
+uv run memorex --workspace ./my-knowledge dossier
+uv run memorex --workspace ./my-knowledge ask "Почему мы отказались от первой идеи?"
+```
+
+Ручной model eval на одинаковых сегментах:
+
+```bash
+uv run memorex --workspace ./my-knowledge eval run 1 \
+  --model openai/gpt-4.1-mini --model qwen/qwen3-30b-a3b
+```
+
+Eval проверяет strict schema, точность evidence и стоимость токенов/времени, но не
+активирует полученные claims.
+
+## Данные workspace
 
 ```text
-.memorex/
-├── memorex.db
-└── objects/<sha256-prefix>/<sha256>
+my-knowledge/
+├── memorex.toml            # имя, язык и роли моделей; без ключей
+├── inbox/                  # контролируемая staging-зона
+└── .memorex/               # runtime, не коммитить
+    ├── memorex.db          # registry, claims, graph, review, eval
+    └── objects/ab/<sha256> # неизменяемые snapshots источников
 ```
 
-`add` не перемещает и не изменяет исходный файл. Snapshot сохраняется один раз по
-SHA-256, а последующая навигация идёт через SQLite, без сканирования object store.
+Перемещение уже обработанного файла распознаётся по checksum, если оно однозначно;
+изменение содержимого создаёт новую revision. После прерванной обработки запись inbox
+возвращается в состояние, из которого её можно безопасно повторить.
+
+## Legacy CLI
+
+Низкоуровневые команды первой итерации (`init`, `add`, `extract`, `claim`, `ask`)
+сохранены для диагностики и обратной совместимости. Для реального использования лучше
+создавать workspace и работать через `inbox compile`: этот pipeline извлекает типы
+решений, сущности, связи и summaries.
 
 ## Разработка
 
@@ -56,14 +105,8 @@ uv run ruff format --check .
 uv run pytest
 ```
 
-CI выполняет те же проверки на Python 3.13. Тесты LLM pipeline используют fake
-provider и не требуют сети или API key.
+Тесты полностью офлайн и используют fake LLM providers. Реальный endpoint smoke test
+должен выполняться только на несекретном тексте.
 
-## Проектные документы
-
-1. `00_PROJECT_CONTEXT.md` — цель и инварианты.
-2. `01_ARCHITECTURE_IDEAS.md` — карта архитектурных подходов.
-3. `02_MVP_AND_EVOLUTION.md` — этапы MVP.
-4. `03_CODEX_STARTER_BRIEF.md` — инженерные ограничения.
-5. `04_OPEN_QUESTIONS.md` — сознательно отложенные решения.
-6. `05_IMPLEMENTATION_STATUS.md` — реализованное состояние и следующие шаги.
+Проектные решения описаны в `00_PROJECT_CONTEXT.md`–`04_OPEN_QUESTIONS.md`, актуальный
+срез реализации — в [`05_IMPLEMENTATION_STATUS.md`](05_IMPLEMENTATION_STATUS.md).
