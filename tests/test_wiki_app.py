@@ -9,6 +9,7 @@ from memorex.config import WorkspaceSettings
 from memorex.wiki_app import create_app, render_markdown
 from memorex.wiki_first.models import AgentRunner, RunnerResult
 from memorex.wiki_first.service import WikiFirstService
+from memorex.wiki_first.storage import WikiStorage
 
 
 class RetrievalRunner(AgentRunner):
@@ -64,6 +65,15 @@ def test_web_setup_upload_last_workspace_and_safe_markdown(tmp_path: Path) -> No
                 "/upload", files={"files": ("note.md", b"# Note\n", "text/markdown")}
             )
             assert uploaded.status_code == 303
+            packet = await client.post("/packets", data={"urls": "https://example.com/article"})
+            assert packet.status_code == 303
+            inbox = (await client.get("/inbox")).text
+            assert "https://example.com/article" in inbox
+            assert "waiting_importer" in inbox
+            invalid = await client.post("/packets", data={"urls": "file:///etc/passwd"})
+            assert invalid.status_code == 422
+            empty = await client.post("/packets", data={"user_note": "", "urls": ""})
+            assert empty.status_code == 422
         remembered = create_app(None, user_settings_path=preferences)
         second = httpx2.ASGITransport(app=remembered)
         async with httpx2.AsyncClient(transport=second, base_url="http://test") as client:
@@ -97,3 +107,188 @@ def test_retrieval_hides_irrelevant_pages_and_merge_preserves_them(tmp_path: Pat
     vault = settings.root / "vault"
     assert (vault / "wiki" / "unrelated-topic.md").is_file()
     assert not (vault / "wiki" / "unrelated-topic.md").stat().st_mode & 0o200
+
+
+def test_web_packet_is_saved_then_automatically_processed(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Test")
+    runner = RetrievalRunner()
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: runner,
+        user_settings_path=tmp_path / "preferences.json",
+    )
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/packets", data={"user_note": "Запомни этот связанный фрагмент."}
+                )
+                assert response.status_code == 303
+                assert response.headers["location"].startswith("/inbox?saved=")
+                receipt = await client.get(response.headers["location"])
+                assert "Сохранено локально" in receipt.text
+                storage = WikiStorage(settings)
+                proposal = None
+                for _attempt in range(100):
+                    proposal = storage.latest_proposal()
+                    if proposal is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert proposal is not None
+                assert proposal["packet_id"] is not None
+                review = await client.get("/review")
+                assert f"Packet {proposal['packet_id']}" in review.text
+                waiting = await client.post(
+                    "/packets", data={"user_note": "Этот Packet должен спокойно подождать."}
+                )
+                assert waiting.headers["location"].startswith("/inbox?saved=")
+                inbox = await client.get("/inbox")
+                assert "Этот Packet должен спокойно подождать" in inbox.text
+                assert "Сохранён · ожидает анализа" in inbox.text
+                statuses = (await client.get("/api/packets")).json()
+                assert any(item["state"] == "queued" for item in statuses)
+
+    asyncio.run(exercise())
+
+
+def test_web_groups_packet_attempts_and_requeue_is_idempotent(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Test")
+    service = WikiFirstService(settings, runner_resolver=lambda _name: RetrievalRunner())
+    packet = service.create_packet(user_note="Сохранённый материал.", files=[], urls=[])
+    revisions = [
+        int(item["id"]) for item in service.storage.packet_source_revisions(str(packet["id"]))
+    ]
+    service.storage.begin_packet_attempt(str(packet["id"]))
+    for number in range(3):
+        job_id = f"failed-{number}"
+        service.storage.create_job(
+            job_id,
+            kind="packet",
+            runner="claude",
+            source_revision_ids=revisions,
+            packet_id=str(packet["id"]),
+        )
+        service.storage.fail_job(job_id, "connection unavailable")
+    service.storage.fail_packet_attempt(
+        str(packet["id"]),
+        job_id="failed-2",
+        error="connection unavailable",
+        retryable=False,
+    )
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: RetrievalRunner(),
+        user_settings_path=tmp_path / "preferences.json",
+    )
+
+    async def exercise() -> None:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+            inbox = (await client.get("/inbox")).text
+            assert inbox.count("Повторить анализ") == 1
+            assert "Retry job" not in inbox
+            assert "Попытки анализа:" in inbox
+            assert "Не удалось связаться с моделью" in inbox
+
+            first = await client.post(f"/packets/{packet['id']}/process")
+            second = await client.post(f"/packets/{packet['id']}/process")
+            assert first.status_code == second.status_code == 303
+
+    asyncio.run(exercise())
+    queued = service.storage.packet_queue(str(packet["id"]))
+    assert queued is not None
+    assert queued["status"] == "queued"
+    assert queued["attempt_count"] == 0
+    assert len(service.storage.packet(str(packet["id"]))["attempts"]) == 3
+
+
+def test_web_shows_live_packet_phase_from_persisted_events(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Test")
+    service = WikiFirstService(settings, runner_resolver=lambda _name: RetrievalRunner())
+    packet = service.create_packet(user_note="Материал в процессе анализа.", files=[], urls=[])
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: RetrievalRunner(),
+        user_settings_path=tmp_path / "preferences.json",
+    )
+    storage = WikiStorage(settings)
+    claimed = storage.claim_next_packet()
+    assert claimed is not None
+    revisions = [int(item["id"]) for item in storage.packet_source_revisions(str(packet["id"]))]
+    storage.create_job(
+        "active-job",
+        kind="packet",
+        runner="codex",
+        source_revision_ids=revisions,
+        packet_id=str(packet["id"]),
+    )
+    storage.add_task_event(
+        "active-task",
+        "runner",
+        {"phase": "runner", "runner": "codex", "model": "test-model"},
+        "active-job",
+    )
+    storage.add_task_event(
+        "active-task",
+        "model-working",
+        {"phase": "model-working", "elapsed_ms": 5000},
+        "active-job",
+    )
+
+    async def exercise() -> None:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+            inbox = (await client.get("/inbox")).text
+            assert "Codex анализирует материалы" in inbox
+            statuses = (await client.get("/api/packets")).json()
+            status = next(item for item in statuses if item["id"] == packet["id"])
+            assert status["state"] == "processing"
+            assert "Codex анализирует материалы" in status["progress"]
+            assert "прошло" in status["progress"]
+
+    asyncio.run(exercise())
+
+
+def test_web_restart_resumes_interrupted_packet_from_persistent_queue(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Test")
+    service = WikiFirstService(settings, runner_resolver=lambda _name: RetrievalRunner())
+    packet = service.create_packet(user_note="Продолжить после рестарта.", files=[], urls=[])
+    claimed = service.storage.claim_next_packet()
+    assert claimed is not None
+    revisions = [
+        int(item["id"]) for item in service.storage.packet_source_revisions(str(packet["id"]))
+    ]
+    service.storage.create_job(
+        "interrupted-job",
+        kind="packet",
+        runner="claude",
+        source_revision_ids=revisions,
+        packet_id=str(packet["id"]),
+    )
+
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: RetrievalRunner(),
+        user_settings_path=tmp_path / "preferences.json",
+    )
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            storage = WikiStorage(settings)
+            proposal = None
+            for _attempt in range(100):
+                proposal = storage.latest_proposal()
+                if proposal is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert proposal is not None
+
+    asyncio.run(exercise())
+    recovered = service.storage.packet(str(packet["id"]))
+    assert recovered["state"] == "review"
+    assert len(recovered["attempts"]) == 2
+    interrupted = service.storage.get_job("interrupted-job")
+    assert interrupted["status"] == "failed"
+    assert "interrupted" in interrupted["rejection_reason"]

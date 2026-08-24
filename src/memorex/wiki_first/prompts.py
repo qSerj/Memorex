@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-INGEST_PROMPT_VERSION = "wiki-first-ingest-v1"
+INGEST_PROMPT_VERSION = "wiki-first-ingest-v3"
 REVISE_PROMPT_VERSION = "wiki-first-revise-v1"
 QUERY_PROMPT_VERSION = "wiki-first-query-v1"
 
@@ -11,6 +11,7 @@ def ingest_prompt(
     source_names: list[str],
     existing: bool,
     selected_pages: list[str] | None = None,
+    packet: bool = False,
 ) -> str:
     mode = (
         "An active Wiki has been copied into wiki/. Preserve useful existing knowledge and "
@@ -19,13 +20,20 @@ def ingest_prompt(
         else "The Wiki is empty. Build its first coherent version."
     )
     listed = "\n".join(f"- sources/{name}" for name in source_names)
+    packet_context = (
+        "The NEW sources are the currently processable text parts of one user Packet. Understand "
+        "them together; the user's note describes why the Packet was saved. Unsupported Packet "
+        "items are intentionally not supplied yet.\n\n"
+        if packet
+        else ""
+    )
     return f"""You are the semantic administrator of a durable {language}-language Wiki.
 
 {mode}
 
-Read every NEW source listed below as a semantically coherent document. Do not reduce it to
-independent 2,000-character fragments. Understand themes, arguments, decisions, changes of view,
-open questions, contradictions, and relations to the existing Wiki.
+{packet_context}Read every NEW source listed below as a semantically coherent document. Do not
+reduce it to independent 2,000-character fragments. Understand themes, arguments, decisions,
+changes of view, open questions, contradictions, and relations to the existing Wiki.
 
 NEW SOURCES:
 {listed}
@@ -63,6 +71,8 @@ uncertainties; ignored low-value material; and self-check results. Finish the fi
 propose a structure. Write proposal-actions.json as strict JSON with an "actions" array. Each item
 has action "upsert", "delete", or "rename", path, and destination only for rename. List every
 created/changed page as upsert; deletions and renames happen only through this explicit manifest.
+Manifest path and destination values are filenames relative to wiki/, for example "README.md" or
+"topic-name.md"—never include the "wiki/" prefix or another directory.
 """
 
 

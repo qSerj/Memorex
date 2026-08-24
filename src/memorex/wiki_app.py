@@ -4,12 +4,14 @@ import html
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
 import webbrowser
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -27,6 +29,17 @@ STATIC = Path(__file__).with_name("wiki_static")
 MAX_UPLOAD = 10 * 1024 * 1024
 WIKI_LINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]*)\]\]")
 MD_LINK = re.compile(r"\[([^]]+)\]\(([^)]+)\)")
+PACKET_STATE_LABELS = {
+    "queued": "Сохранён · ожидает анализа",
+    "processing": "Анализируется",
+    "retry_wait": "Связь прервалась · повторим автоматически",
+    "review": "Готов к проверке",
+    "remembered": "Добавлен в память",
+    "processed": "Обработан · Wiki без изменений",
+    "failed": "Анализ не завершён",
+    "ready": "Сохранён · можно разобрать",
+    "waiting_importer": "Сохранён · ожидает импортера",
+}
 
 
 class UserSettings:
@@ -55,6 +68,11 @@ class WorkspaceTasks:
         self.queries = ThreadPoolExecutor(max_workers=2, thread_name_prefix="memorex-query")
         self.cancel: dict[str, threading.Event] = {}
         self.futures: dict[str, Future[object]] = {}
+        self.kinds: dict[str, str] = {}
+        self.queue_wake = threading.Event()
+        self.shutdown_event = threading.Event()
+        self.queue_thread: threading.Thread | None = None
+        self.task_lock = threading.RLock()
 
     def submit(self, kind: str, action: str, *args: object) -> str:
         task_id = uuid.uuid4().hex[:12]
@@ -68,6 +86,10 @@ class WorkspaceTasks:
             try:
                 if action == "ingest":
                     return service.ingest()
+                if action == "packet":
+                    return service.ingest_packet(str(args[0]))
+                if action == "packet_claimed":
+                    return service.ingest_packet(str(args[0]), queue_claimed=True)
                 if action == "revise":
                     return service.revise(str(args[0]), str(args[1]))
                 if action == "retry":
@@ -82,11 +104,64 @@ class WorkspaceTasks:
                 raise
 
         pool = self.queries if kind == "query" else self.mutations
-        self.futures[task_id] = pool.submit(work)
+        with self.task_lock:
+            self.kinds[task_id] = kind
+            self.futures[task_id] = pool.submit(work)
+            self.futures[task_id].add_done_callback(lambda _future: self.wake_queue())
         return task_id
 
+    def start(self) -> None:
+        if self.queue_thread is not None:
+            return
+        self.queue_thread = threading.Thread(
+            target=self._queue_loop,
+            name="memorex-packet-queue",
+            daemon=True,
+        )
+        self.queue_thread.start()
+        self.wake_queue()
+
+    def shutdown(self) -> None:
+        self.shutdown_event.set()
+        self.queue_wake.set()
+        with self.task_lock:
+            for event in self.cancel.values():
+                event.set()
+        if self.queue_thread is not None:
+            self.queue_thread.join(timeout=2)
+        self.mutations.shutdown(wait=False, cancel_futures=True)
+        self.queries.shutdown(wait=False, cancel_futures=True)
+
+    def wake_queue(self) -> None:
+        self.queue_wake.set()
+
+    def _queue_loop(self) -> None:
+        storage = WikiFirstService(self.settings, runner_resolver=self.resolver).storage
+        while not self.shutdown_event.is_set():
+            self.queue_wake.wait(timeout=0.5)
+            self.queue_wake.clear()
+            if self.shutdown_event.is_set():
+                continue
+            try:
+                with self.task_lock:
+                    if self.mutation_busy() or storage.status()["proposal"] is not None:
+                        continue
+                    queued = storage.claim_next_packet()
+                    if queued is not None:
+                        self.submit("mutation", "packet_claimed", str(queued["packet_id"]))
+            except (OSError, sqlite3.Error, ValueError):
+                continue
+
+    def mutation_busy(self) -> bool:
+        with self.task_lock:
+            return any(
+                self.kinds.get(task_id) != "query" and not future.done()
+                for task_id, future in self.futures.items()
+            )
+
     def stop(self, task_id: str) -> bool:
-        event = self.cancel.get(task_id)
+        with self.task_lock:
+            event = self.cancel.get(task_id)
         if event is None:
             return False
         event.set()
@@ -101,21 +176,36 @@ def create_app(
 ) -> FastAPI:
     preferences = UserSettings(user_settings_path)
     chosen = root.expanduser().resolve() if root else preferences.load()
-    state: dict[str, Any] = {"root": None, "settings": None, "service": None, "tasks": None}
+    state: dict[str, Any] = {
+        "root": None,
+        "settings": None,
+        "service": None,
+        "tasks": None,
+        "lifespan_active": False,
+    }
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        yield
+        state["lifespan_active"] = True
         tasks: WorkspaceTasks | None = state.get("tasks")
         if tasks:
-            tasks.mutations.shutdown(wait=False, cancel_futures=True)
-            tasks.queries.shutdown(wait=False, cancel_futures=True)
+            tasks.start()
+        try:
+            yield
+        finally:
+            state["lifespan_active"] = False
+            tasks = state.get("tasks")
+            if tasks:
+                tasks.shutdown()
 
     app = FastAPI(title="Memorex Wiki", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     templates = Jinja2Templates(directory=TEMPLATES)
 
     def select(path: Path, create: bool = False, name: str | None = None) -> None:
+        previous: WorkspaceTasks | None = state.get("tasks")
+        if previous:
+            previous.shutdown()
         resolved = path.expanduser().resolve()
         settings = (
             WorkspaceSettings.create(resolved, name or resolved.name)
@@ -126,12 +216,15 @@ def create_app(
         service.initialize()
         service.storage.recover_interrupted_jobs()
         preferences.save(resolved)
+        tasks = WorkspaceTasks(settings, runner_resolver)
         state.update(
             root=resolved,
             settings=settings,
             service=service,
-            tasks=WorkspaceTasks(settings, runner_resolver),
+            tasks=tasks,
         )
+        if state["lifespan_active"]:
+            tasks.start()
 
     if chosen and (chosen / "memorex.toml").is_file():
         select(chosen)
@@ -154,7 +247,7 @@ def create_app(
             data.update(
                 status=svc.status(),
                 pages=svc.storage.list_pages(snapshot),
-                jobs=svc.storage.jobs(),
+                jobs=svc.storage.jobs(include_packets=False),
                 history=svc.history(),
                 chats=svc.storage.chat_sessions(),
                 proposal=svc.storage.latest_proposal(),
@@ -203,17 +296,76 @@ def create_app(
 
     @app.get("/inbox", response_class=HTMLResponse)
     async def inbox(request: Request) -> HTMLResponse:
-        scanned = service().scan()
+        svc = service()
+        scanned = svc.scan()
+        packets = [_decorate_packet(packet) for packet in svc.storage.packets()]
         return templates.TemplateResponse(
-            request=request, name="app.html", context=context(request, "inbox", scanned=scanned)
+            request=request,
+            name="app.html",
+            context=context(
+                request,
+                "inbox",
+                scanned=scanned,
+                packets=packets,
+                saved=request.query_params.get("saved"),
+            ),
         )
+
+    @app.post("/packets")
+    async def create_packet(
+        user_note: Annotated[str, Form()] = "",
+        urls: Annotated[str, Form()] = "",
+        files: Annotated[list[UploadFile] | None, File()] = None,
+    ) -> RedirectResponse:
+        uploads: list[tuple[str, str | None, bytes]] = []
+        for upload in files or []:
+            name = upload.filename or ""
+            if not name:
+                continue
+            if (
+                name != Path(name).name
+                or "\\" in name
+                or Path(name).suffix.lower() not in {".md", ".txt"}
+            ):
+                raise HTTPException(415, "Only safe .md and .txt filenames are accepted")
+            data = await upload.read(MAX_UPLOAD + 1)
+            if len(data) > MAX_UPLOAD:
+                raise HTTPException(413, f"{name} is larger than 10 MiB")
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(415, f"{name} must be UTF-8") from exc
+            uploads.append((name, upload.content_type, data))
+        packet = service().create_packet(
+            user_note=user_note,
+            files=uploads,
+            urls=[line for line in urls.splitlines() if line.strip()],
+        )
+        state["tasks"].wake_queue()
+        return RedirectResponse(f"/inbox?saved={packet['id']}", status_code=303)
+
+    @app.post("/packets/{packet_id}/process")
+    async def process_packet(packet_id: str) -> RedirectResponse:
+        try:
+            packet = service().storage.packet(packet_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        if not packet["processable_count"]:
+            raise HTTPException(409, "Packet has no text sources awaiting processing")
+        service().queue_packet(packet_id)
+        state["tasks"].wake_queue()
+        return RedirectResponse("/inbox", status_code=303)
 
     @app.post("/upload")
     async def upload(files: Annotated[list[UploadFile], File()]) -> RedirectResponse:
         settings: WorkspaceSettings = state["settings"]
         for upload in files:
             name = Path(upload.filename or "").name
-            if name != upload.filename or Path(name).suffix.lower() not in {".md", ".txt"}:
+            if (
+                name != upload.filename
+                or "\\" in name
+                or Path(name).suffix.lower() not in {".md", ".txt"}
+            ):
                 raise HTTPException(415, "Only .md and .txt are accepted")
             data = await upload.read(MAX_UPLOAD + 1)
             if len(data) > MAX_UPLOAD:
@@ -243,6 +395,7 @@ def create_app(
         if not proposal:
             raise HTTPException(409, "No proposal awaiting review")
         service().apply(str(proposal["job_id"]))
+        state["tasks"].wake_queue()
         return RedirectResponse("/", status_code=303)
 
     @app.post("/review/reject")
@@ -251,6 +404,7 @@ def create_app(
         if not proposal:
             raise HTTPException(409, "No proposal awaiting review")
         service().reject(str(proposal["job_id"]), reason)
+        state["tasks"].wake_queue()
         return RedirectResponse("/review", status_code=303)
 
     @app.post("/review/revise")
@@ -268,8 +422,33 @@ def create_app(
 
     @app.post("/tasks/retry/{job_id}")
     async def retry(job_id: str) -> RedirectResponse:
+        try:
+            job = service().storage.get_job(job_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        if job.get("packet_id"):
+            service().queue_packet(str(job["packet_id"]))
+            state["tasks"].wake_queue()
+            return RedirectResponse("/inbox", status_code=303)
         task = state["tasks"].submit("mutation", "retry", job_id)
         return RedirectResponse(f"/tasks/{task}", status_code=303)
+
+    @app.get("/api/packets")
+    async def packet_statuses() -> JSONResponse:
+        packets = [_decorate_packet(packet) for packet in service().storage.packets()]
+        return JSONResponse(
+            [
+                {
+                    "id": packet["id"],
+                    "state": packet["state"],
+                    "state_label": packet["state_label"],
+                    "progress": packet["progress"],
+                    "last_error": packet["error_summary"],
+                    "attempt_count": len(packet["attempts"]),
+                }
+                for packet in packets
+            ]
+        )
 
     @app.get("/tasks/{task_id}", response_class=HTMLResponse)
     async def task_page(request: Request, task_id: str) -> HTMLResponse:
@@ -287,7 +466,7 @@ def create_app(
                 for row in rows:
                     after = int(row["id"])
                     yield f"id: {after}\ndata: {json.dumps(row['payload'], ensure_ascii=False)}\n\n"
-                    if row["phase"] in {"review-ready", "error", "cancelled"}:
+                    if row["phase"] in {"review-ready", "done", "error", "cancelled"}:
                         return
                 future = state["tasks"].futures.get(task_id)
                 if future and future.done() and not rows:
@@ -372,6 +551,112 @@ def create_app(
         return JSONResponse({"detail": str(exc)}, status_code=422)
 
     return app
+
+
+def _decorate_packet(packet: dict[str, Any]) -> dict[str, Any]:
+    result = {**packet}
+    queue = packet.get("queue") or {}
+    latest = packet.get("latest_job") or {}
+    raw_error = str(queue.get("last_error") or latest.get("rejection_reason") or "")
+    result["state_label"] = PACKET_STATE_LABELS.get(str(packet["state"]), str(packet["state"]))
+    result["progress"] = _packet_progress(packet)
+    result["error_summary"] = _friendly_packet_error(raw_error)
+    result["raw_error"] = raw_error
+    result["attempts"] = [
+        {
+            **attempt,
+            "error_summary": _friendly_packet_error(str(attempt.get("rejection_reason") or "")),
+        }
+        for attempt in packet.get("attempts", [])
+    ]
+    return result
+
+
+def _packet_progress(packet: dict[str, Any]) -> str:
+    state = str(packet["state"])
+    queue = packet.get("queue") or {}
+    if state == "queued":
+        return "Ожидает свободного места в очереди"
+    if state == "retry_wait":
+        remaining = _seconds_until(queue.get("available_at"))
+        return (
+            f"Автоматическая повторная попытка через {_format_duration(remaining)}"
+            if remaining > 0
+            else "Готовим автоматическую повторную попытку"
+        )
+    if state != "processing":
+        return ""
+
+    latest = packet.get("latest_job") or {}
+    event = packet.get("latest_event") or {}
+    payload = event.get("payload") or {}
+    phase = str(event.get("phase") or "")
+    runner = str(payload.get("runner") or latest.get("runner") or "").capitalize()
+    if phase == "retrieval":
+        message = "Подбираем связанные страницы Wiki"
+    elif phase == "runner":
+        message = f"{runner} запускается" if runner else "Запускаем модель"
+    elif phase == "model-started":
+        message = f"{runner} начал анализ" if runner else "Модель начала анализ"
+    elif phase == "model-working":
+        message = f"{runner} анализирует материалы" if runner else "Модель анализирует материалы"
+    elif phase == "model-completed":
+        message = (
+            f"{runner} закончил анализ; проверяем результат"
+            if runner
+            else "Модель закончила анализ; проверяем результат"
+        )
+    elif phase == "fallback":
+        fallback = str(payload.get("fallback") or "запасную модель").capitalize()
+        message = f"Первый анализ не завершён; пробуем {fallback}"
+    else:
+        message = "Готовим материалы к анализу"
+    started_at = latest.get("created_at") or queue.get("updated_at")
+    elapsed = _seconds_since(started_at)
+    return f"{message} · прошло {_format_duration(elapsed)}"
+
+
+def _seconds_since(value: object) -> int:
+    parsed = _parse_datetime(value)
+    return max(0, int((datetime.now(UTC) - parsed).total_seconds())) if parsed else 0
+
+
+def _seconds_until(value: object) -> int:
+    parsed = _parse_datetime(value)
+    return max(0, int((parsed - datetime.now(UTC)).total_seconds())) if parsed else 0
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} с"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} мин {remainder:02d} с"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes:02d} мин"
+
+
+def _friendly_packet_error(error: str) -> str:
+    if not error:
+        return ""
+    lowered = error.lower()
+    if "file exists" in lowered and "-merged" in lowered:
+        return "Внутренняя ошибка сборки результата. Packet сохранён и его можно повторить."
+    if "interrupted" in lowered:
+        return "Анализ был прерван. Packet сохранён и вернётся в очередь."
+    if "timed out" in lowered or "timeout" in lowered:
+        return "Модель не ответила вовремя. Memorex повторит анализ автоматически."
+    if any(marker in lowered for marker in ("connection", "network", "transport", "http/request")):
+        return "Не удалось связаться с моделью. Memorex повторит анализ автоматически."
+    return error
 
 
 def render_markdown(text: str) -> str:

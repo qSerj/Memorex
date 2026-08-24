@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from threading import Event
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -30,6 +31,12 @@ from memorex.wiki_first.validation import validate_wiki
 
 class WikiFirstError(ValueError):
     pass
+
+
+class WikiFirstProcessingError(WikiFirstError):
+    def __init__(self, message: str, *, retryable: bool):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 RunnerResolver = Callable[[str], AgentRunner]
@@ -103,12 +110,173 @@ class WikiFirstService:
             "tell", [self.storage.source_revision(int(revision["id"]))], runner, text
         )
 
+    def create_packet(
+        self,
+        *,
+        user_note: str,
+        files: list[tuple[str, str | None, bytes]],
+        urls: list[str],
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        cleaned_urls = [_validate_packet_url(url) for url in urls if url.strip()]
+        try:
+            return self.storage.create_packet(
+                user_note=user_note,
+                files=files,
+                urls=cleaned_urls,
+            )
+        except ValueError as exc:
+            raise WikiFirstError(str(exc)) from exc
+
+    def queue_packet(self, packet_id: str) -> dict[str, object]:
+        self.storage.initialize()
+        try:
+            return self.storage.queue_packet(packet_id, reset_attempts=True)
+        except ValueError as exc:
+            raise WikiFirstError(str(exc)) from exc
+
+    def ingest_packet(
+        self,
+        packet_id: str,
+        *,
+        runner_name: str | None = None,
+        queue_claimed: bool = False,
+    ) -> dict[str, object]:
+        self.storage.initialize()
+        if not queue_claimed:
+            self.storage.recover_interrupted_jobs()
+        self.storage.verify_active()
+        runner = runner_name or self.settings.wiki.ingest_runner
+        _validate_runner_name(runner)
+        try:
+            packet = self.storage.packet(packet_id)
+        except ValueError as exc:
+            raise WikiFirstError(str(exc)) from exc
+        pending = self.storage.packet_source_revisions(packet_id)
+        if not pending:
+            status = "waiting_importer" if packet["waiting_importer_count"] else "unchanged"
+            return {"status": status, "packet_id": packet_id, "pending_sources": 0}
+        if self.storage.status()["proposal"] is not None:
+            raise WikiFirstError("Finish or reject the current proposal before processing Packet")
+        try:
+            if not queue_claimed:
+                self.storage.begin_packet_attempt(packet_id)
+            recovered = self._recover_failed_packet_proposal(packet_id)
+            if recovered is not None:
+                return recovered
+            return self._create_proposal(
+                "packet",
+                pending,
+                runner,
+                str(packet["user_note"]) or None,
+                packet_id=packet_id,
+            )
+        except WikiFirstProcessingError as exc:
+            failed = self.storage.packet(packet_id).get("latest_job")
+            self.storage.fail_packet_attempt(
+                packet_id,
+                job_id=str(failed["id"]) if failed else None,
+                error=str(exc),
+                retryable=exc.retryable,
+            )
+            raise
+        except Exception as exc:
+            failed = self.storage.packet(packet_id).get("latest_job")
+            if failed and failed["status"] == "running":
+                self.storage.fail_job(str(failed["id"]), str(exc))
+            self.storage.fail_packet_attempt(
+                packet_id,
+                job_id=str(failed["id"]) if failed else None,
+                error=str(exc),
+                retryable=False,
+            )
+            raise
+
+    def _recover_failed_packet_proposal(self, packet_id: str) -> dict[str, object] | None:
+        packet = self.storage.packet(packet_id)
+        job = packet.get("latest_job")
+        if not job or job["status"] != "failed" or int(job["current_revision"]) != 0:
+            return None
+        call = self.storage.latest_successful_call(str(job["id"]))
+        stage = self.storage.jobs_dir / str(job["id"]) / "rev-1"
+        if (
+            call is None
+            or not (stage / "wiki").is_dir()
+            or not (stage / "sources").is_dir()
+            or not (stage / "proposal-report.md").is_file()
+            or str(self.storage.active_snapshot()["id"]) != str(job["base_snapshot_id"])
+        ):
+            return None
+        base = self.storage.snapshot_path(self._snapshot(str(job["base_snapshot_id"])))
+        selected_pages = sorted(
+            page.stem
+            for page in (stage / "wiki").glob("*.md")
+            if (base / "wiki" / page.name).is_file()
+        )
+        try:
+            self._merge_stage(base, stage)
+            validation = self._validate_stage(stage, job)
+        except (OSError, WikiFirstError):
+            return None
+        if not validation["valid"]:
+            return None
+        runner = str(call["runner"])
+        self.storage.set_job_runner(str(job["id"]), runner)
+        retrieval = {
+            "selected_pages": selected_pages,
+            "selected_count": len(selected_pages),
+            "total_pages": len(list((base / "wiki").glob("*.md"))),
+            "recovered": True,
+        }
+        report = (stage / "proposal-report.md").read_text(encoding="utf-8")
+        if not changed_pages(base / "wiki", stage / "wiki"):
+            self.storage.finish_job_without_changes(
+                str(job["id"]),
+                relative_path=str(stage.relative_to(self.storage.root)),
+                tree_hash=hash_tree(stage),
+                validation_json=json.dumps(validation, ensure_ascii=False),
+                retrieval_json=json.dumps(retrieval, ensure_ascii=False),
+            )
+            self._emit("done", job_id=job["id"], status="no_change", recovered=True)
+            return {
+                "status": "no_change",
+                "job_id": job["id"],
+                "packet_id": packet_id,
+                "runner": runner,
+                "model": call["model"],
+                "report": report,
+                "validation": validation,
+                "recovered": True,
+            }
+        self.storage.add_proposal_revision(
+            str(job["id"]),
+            revision_no=1,
+            relative_path=str(stage.relative_to(self.storage.root)),
+            tree_hash=hash_tree(stage),
+            validation_json=json.dumps(validation, ensure_ascii=False),
+            feedback=None,
+            retrieval_json=json.dumps(retrieval, ensure_ascii=False),
+        )
+        self._emit("review-ready", job_id=job["id"], status="proposed", recovered=True)
+        return {
+            "status": "proposed",
+            "job_id": job["id"],
+            "packet_id": packet_id,
+            "runner": runner,
+            "model": call["model"],
+            "duration_ms": int(call["duration_ms"]),
+            "validation": validation,
+            "report": report,
+            "retrieval": retrieval,
+            "recovered": True,
+        }
+
     def review(self, job_id: str) -> dict[str, object]:
         proposal = self.storage.proposal(job_id)
         stage = self.storage.root / str(proposal["relative_path"])
         base = self.storage.snapshot_path(self._snapshot(str(proposal["base_snapshot_id"])))
         report = stage / "proposal-report.md"
-        return {
+        result = {
             "job_id": job_id,
             "revision": proposal["revision_no"],
             "runner": proposal["runner"],
@@ -118,6 +286,9 @@ class WikiFirstService:
             "changed_pages": changed_pages(base / "wiki", stage / "wiki"),
             "diff": directory_diff(base / "wiki", stage / "wiki"),
         }
+        if proposal.get("packet_id"):
+            result["packet"] = self.storage.packet(str(proposal["packet_id"]))
+        return result
 
     def revise(
         self, job_id: str, feedback: str, *, runner_name: str | None = None
@@ -215,7 +386,11 @@ class WikiFirstService:
             raise WikiFirstError("Job is not retryable")
         pending = [self.storage.source_revision(item) for item in job["source_revision_ids"]]
         return self._create_proposal(
-            str(job["kind"]), pending, str(job["runner"]), job.get("user_input")
+            str(job["kind"]),
+            pending,
+            str(job["runner"]),
+            job.get("user_input"),
+            packet_id=str(job["packet_id"]) if job.get("packet_id") else None,
         )
 
     def ask(
@@ -347,17 +522,27 @@ class WikiFirstService:
         return status
 
     def _create_proposal(
-        self, kind: str, pending: list[dict[str, object]], runner_name: str, user_input: str | None
+        self,
+        kind: str,
+        pending: list[dict[str, object]],
+        runner_name: str,
+        user_input: str | None,
+        *,
+        packet_id: str | None = None,
     ) -> dict[str, object]:
         job_id = uuid.uuid4().hex[:12]
         self._job_id = job_id
-        job = self.storage.create_job(
-            job_id,
-            kind=kind,
-            runner=runner_name,
-            source_revision_ids=[int(x["id"]) for x in pending],
-            user_input=user_input,
-        )
+        try:
+            job = self.storage.create_job(
+                job_id,
+                kind=kind,
+                runner=runner_name,
+                source_revision_ids=[int(x["id"]) for x in pending],
+                user_input=user_input,
+                packet_id=packet_id,
+            )
+        except ValueError as exc:
+            raise WikiFirstError(str(exc)) from exc
         base = self.storage.snapshot_path(self._snapshot(str(job["base_snapshot_id"])))
         selected = self.storage.search_pages(self._source_terms(pending), limit=8, related_limit=4)
         if "README" not in selected:
@@ -371,10 +556,12 @@ class WikiFirstService:
             source_names=names,
             existing=str(job["base_snapshot_id"]) != "initial",
             selected_pages=selected,
+            packet=packet_id is not None,
         )
         result = None
         validation = None
         last_error: Exception | None = None
+        last_retryable = False
         for candidate in (runner_name, "codex" if runner_name == "claude" else "claude"):
             try:
                 if candidate != runner_name:
@@ -396,17 +583,41 @@ class WikiFirstService:
                 if validation["valid"]:
                     break
                 last_error = WikiFirstError("; ".join(validation["errors"]))
+                last_retryable = False
             except RunnerCancelled as exc:
                 self.storage.cancel_job(job_id)
+                if packet_id is not None:
+                    raise WikiFirstProcessingError(str(exc), retryable=True) from exc
                 raise WikiFirstError(str(exc)) from exc
             except (RunnerError, WikiFirstError, OSError) as exc:
                 last_error = exc
+                last_retryable = isinstance(exc, RunnerError)
         if result is None or validation is None or not validation["valid"]:
             self.storage.fail_job(job_id, str(last_error or "proposal failed"))
-            raise WikiFirstError(
-                f"Both Wiki runners failed for job {job_id}: {last_error or 'invalid proposal'}"
+            raise WikiFirstProcessingError(
+                f"Both Wiki runners failed for job {job_id}: {last_error or 'invalid proposal'}",
+                retryable=last_retryable,
             )
         self.storage.set_job_runner(job_id, result.runner)
+        if not changed_pages(base / "wiki", stage / "wiki"):
+            report = stage / "proposal-report.md"
+            self.storage.finish_job_without_changes(
+                job_id,
+                relative_path=str(stage.relative_to(self.storage.root)),
+                tree_hash=hash_tree(stage),
+                validation_json=json.dumps(validation, ensure_ascii=False),
+                retrieval_json=json.dumps(retrieval, ensure_ascii=False),
+            )
+            self._emit("done", job_id=job_id, status="no_change")
+            return {
+                "status": "no_change",
+                "job_id": job_id,
+                "packet_id": packet_id,
+                "runner": result.runner,
+                "model": result.model,
+                "report": report.read_text(encoding="utf-8") if report.is_file() else "",
+                "validation": validation,
+            }
         self.storage.add_proposal_revision(
             job_id,
             revision_no=1,
@@ -478,35 +689,48 @@ class WikiFirstService:
             )
         except ValidationError as exc:
             raise WikiFirstError(f"Invalid proposal-actions.json: {exc}") from exc
-        merged = stage.parent / f".{stage.name}-merged"
-        shutil.copytree(base / "wiki", merged / "wiki")
-        shutil.copytree(base / "sources", merged / "sources")
-        _make_writable(merged)
-        for source in (stage / "sources").glob("*"):
-            if source.is_file():
-                shutil.copy2(source, merged / "sources" / source.name)
-        for action in manifest.actions:
-            name = _safe_page(action.path)
-            target = merged / "wiki" / name
-            if action.action == "upsert":
-                authored = stage / "wiki" / name
-                if not authored.is_file():
-                    raise WikiFirstError(f"Manifest upsert is missing file: {name}")
-                shutil.copy2(authored, target)
-            elif action.action == "delete":
-                if target.exists():
-                    target.unlink()
-            else:
-                destination = _safe_page(action.destination or "")
-                if not target.is_file():
-                    raise WikiFirstError(f"Manifest rename source is missing: {name}")
-                target.rename(merged / "wiki" / destination)
-        for extra in ("proposal-report.md", "proposal-actions.json"):
-            if (stage / extra).is_file():
-                shutil.copy2(stage / extra, merged / extra)
-        _make_writable(stage)
-        shutil.rmtree(stage)
-        merged.rename(stage)
+        suffix = uuid.uuid4().hex[:8]
+        merged = stage.parent / f".{stage.name}-merged-{suffix}"
+        backup = stage.parent / f".{stage.name}-authored-{suffix}"
+        try:
+            shutil.copytree(base / "wiki", merged / "wiki")
+            shutil.copytree(base / "sources", merged / "sources")
+            _make_writable(merged)
+            for source in (stage / "sources").glob("*"):
+                if source.is_file():
+                    shutil.copy2(source, merged / "sources" / source.name)
+            for action in manifest.actions:
+                name = _safe_page(action.path)
+                target = merged / "wiki" / name
+                if action.action == "upsert":
+                    authored = stage / "wiki" / name
+                    if not authored.is_file():
+                        raise WikiFirstError(f"Manifest upsert is missing file: {name}")
+                    shutil.copy2(authored, target)
+                elif action.action == "delete":
+                    if target.exists():
+                        target.unlink()
+                else:
+                    destination = _safe_page(action.destination or "")
+                    if not target.is_file():
+                        raise WikiFirstError(f"Manifest rename source is missing: {name}")
+                    target.rename(merged / "wiki" / destination)
+            for extra in ("proposal-report.md", "proposal-actions.json"):
+                if (stage / extra).is_file():
+                    shutil.copy2(stage / extra, merged / extra)
+            _make_writable(stage)
+            stage.rename(backup)
+            try:
+                merged.rename(stage)
+            except Exception:
+                backup.rename(stage)
+                raise
+            shutil.rmtree(backup)
+        except Exception:
+            if merged.exists():
+                _make_writable(merged)
+                shutil.rmtree(merged)
+            raise
 
     def _retrieval(self, selected: list[str], wiki: Path) -> dict[str, object]:
         existing = [x for x in selected if (wiki / f"{x}.md").is_file()]
@@ -614,8 +838,9 @@ def _chat_context(messages: list[dict[str, object]]) -> str:
 
 
 def _safe_page(value: str) -> str:
-    name = Path(value).name
-    if value != name or not SAFE_PAGE.fullmatch(name):
+    normalized = value.removeprefix("wiki/")
+    name = Path(normalized).name
+    if "\\" in normalized or normalized != name or not SAFE_PAGE.fullmatch(name):
         raise WikiFirstError(f"Unsafe Wiki page path: {value}")
     return name
 
@@ -664,6 +889,20 @@ def _safe_source_name(name: str) -> str:
 def _validate_runner_name(name: str) -> None:
     if name not in {"claude", "codex"}:
         raise WikiFirstError(f"Unsupported Wiki runner: {name}; choose claude or codex")
+
+
+def _validate_packet_url(value: str) -> str:
+    url = value.strip()
+    parsed = urlsplit(url)
+    try:
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise WikiFirstError(f"Malformed Packet URL: {value}") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or hostname is None:
+        raise WikiFirstError(f"Packet URL must be an absolute HTTP(S) URL: {value}")
+    if any(character.isspace() or character == "\0" for character in url):
+        raise WikiFirstError("Packet URL contains control characters")
+    return url
 
 
 def _make_read_only(root: Path) -> None:

@@ -8,11 +8,13 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from memorex.config import WorkspaceSettings
+
+MIGRATIONS = Path(__file__).parent.parent / "migrations"
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -121,6 +123,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
 
 WIKI_LINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]*)\]\]")
 WORD = re.compile(r"[^\W_]{3,}", re.UNICODE)
+PACKET_RETRY_DELAYS_SECONDS = (5, 30)
 
 
 def utc_now() -> str:
@@ -147,6 +150,7 @@ class WikiStorage:
             path.mkdir(parents=True, exist_ok=True)
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+            self._apply_migrations(connection)
             self._ensure_runner_call_columns(connection)
             self._ensure_proposal_columns(connection)
             active = connection.execute(
@@ -172,6 +176,7 @@ class WikiStorage:
                     "VALUES (?, NULL, 'initialize', ?)",
                     (snapshot_id, now),
                 )
+        self.reconcile_packet_queue()
         self.rebuild_fts()
         self.sync_vault()
         return {"root": str(self.root), "snapshot": self.active_snapshot()["id"]}
@@ -206,53 +211,72 @@ class WikiStorage:
         return self.root / str(snapshot["relative_path"])
 
     def register_source(self, path: Path, *, kind: str = "file") -> dict[str, Any]:
-        data = path.read_bytes()
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"Source is not UTF-8: {path}") from exc
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        normalized_data = normalized.encode("utf-8")
-        checksum = hashlib.sha256(data).hexdigest()
-        normalized_checksum = hashlib.sha256(normalized_data).hexdigest()
-        object_path = self._store_bytes(data, checksum, "raw")
-        normalized_path = self._store_bytes(normalized_data, normalized_checksum, "normalized")
-        canonical = str(path.resolve())
-        now = utc_now()
+        return self.register_text_bytes(
+            path.read_bytes(), canonical_path=str(path.resolve()), kind=kind
+        )
+
+    def register_text_bytes(
+        self, data: bytes, *, canonical_path: str, kind: str = "file"
+    ) -> dict[str, Any]:
+        checksum, object_path, normalized_path = self._prepare_text_bytes(data, canonical_path)
         with self.connection() as connection:
-            source = connection.execute(
-                "SELECT * FROM sources WHERE canonical_path = ?", (canonical,)
-            ).fetchone()
-            if source is None:
-                cursor = connection.execute(
-                    "INSERT INTO sources(canonical_path, kind, created_at) VALUES (?, ?, ?)",
-                    (canonical, kind, now),
-                )
-                source_id = int(cursor.lastrowid)
-                revision_no = 1
-            else:
-                source_id = int(source["id"])
-                current = connection.execute(
-                    "SELECT * FROM source_revisions WHERE source_id = ? "
-                    "ORDER BY revision_no DESC LIMIT 1",
-                    (source_id,),
-                ).fetchone()
-                if current is not None and current["sha256"] == checksum:
-                    return {**dict(current), "status": "unchanged", "canonical_path": canonical}
-                revision_no = int(current["revision_no"]) + 1 if current else 1
-            cursor = connection.execute(
-                "INSERT INTO source_revisions(source_id, revision_no, sha256, object_path, "
-                "normalized_path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    source_id,
-                    revision_no,
-                    checksum,
-                    str(object_path.relative_to(self.root)),
-                    str(normalized_path.relative_to(self.root)),
-                    now,
-                ),
+            return self._register_text(
+                connection,
+                canonical_path=canonical_path,
+                kind=kind,
+                checksum=checksum,
+                object_path=object_path,
+                normalized_path=normalized_path,
             )
-            revision_id = int(cursor.lastrowid)
+
+    def _register_text(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        canonical_path: str,
+        kind: str,
+        checksum: str,
+        object_path: Path,
+        normalized_path: Path,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        source = connection.execute(
+            "SELECT * FROM sources WHERE canonical_path = ?", (canonical_path,)
+        ).fetchone()
+        if source is None:
+            cursor = connection.execute(
+                "INSERT INTO sources(canonical_path, kind, created_at) VALUES (?, ?, ?)",
+                (canonical_path, kind, now),
+            )
+            source_id = int(cursor.lastrowid)
+            revision_no = 1
+        else:
+            source_id = int(source["id"])
+            current = connection.execute(
+                "SELECT * FROM source_revisions WHERE source_id = ? "
+                "ORDER BY revision_no DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if current is not None and current["sha256"] == checksum:
+                return {
+                    **dict(current),
+                    "status": "unchanged",
+                    "canonical_path": canonical_path,
+                }
+            revision_no = int(current["revision_no"]) + 1 if current else 1
+        cursor = connection.execute(
+            "INSERT INTO source_revisions(source_id, revision_no, sha256, object_path, "
+            "normalized_path, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                source_id,
+                revision_no,
+                checksum,
+                str(object_path.relative_to(self.root)),
+                str(normalized_path.relative_to(self.root)),
+                now,
+            ),
+        )
+        revision_id = int(cursor.lastrowid)
         return {
             "id": revision_id,
             "source_id": source_id,
@@ -260,7 +284,7 @@ class WikiStorage:
             "sha256": checksum,
             "normalized_path": str(normalized_path.relative_to(self.root)),
             "status": "added" if revision_no == 1 else "changed",
-            "canonical_path": canonical,
+            "canonical_path": canonical_path,
         }
 
     def register_user_text(self, text: str, label: str) -> dict[str, Any]:
@@ -273,6 +297,412 @@ class WikiStorage:
         note.write_text(f"# Сообщение пользователя\n\n{text.strip()}\n", encoding="utf-8")
         return self.register_source(note, kind="user")
 
+    def create_packet(
+        self,
+        *,
+        user_note: str,
+        files: list[tuple[str, str | None, bytes]],
+        urls: list[str],
+    ) -> dict[str, Any]:
+        note = user_note.strip()
+        if not note and not files and not urls:
+            raise ValueError("Packet must contain a note, file, or URL")
+        for name, _mime_type, _data in files:
+            if (
+                name != Path(name).name
+                or "\\" in name
+                or Path(name).suffix.lower() not in {".md", ".txt"}
+            ):
+                raise ValueError(f"Unsafe or unsupported Packet filename: {name}")
+        if any(not url.strip() for url in urls):
+            raise ValueError("Packet URLs must not be empty")
+
+        packet_id = uuid.uuid4().hex[:12]
+        now = utc_now()
+        prepared_note: tuple[str, Path, Path] | None = None
+        if note:
+            note_data = f"# Сообщение пользователя\n\n{note}\n".encode()
+            prepared_note = self._prepare_text_bytes(note_data, f"packet://{packet_id}/note.md")
+        prepared_files = []
+        for ordinal, (name, mime_type, data) in enumerate(files):
+            item_id = uuid.uuid4().hex[:12]
+            canonical = f"packet://{packet_id}/{item_id}/{name}"
+            prepared_files.append(
+                (
+                    item_id,
+                    ordinal,
+                    name,
+                    mime_type
+                    or ("text/markdown" if Path(name).suffix.lower() == ".md" else "text/plain"),
+                    canonical,
+                    self._prepare_text_bytes(data, canonical),
+                )
+            )
+
+        with self.connection() as connection:
+            note_revision_id = None
+            if prepared_note is not None:
+                checksum, object_path, normalized_path = prepared_note
+                revision = self._register_text(
+                    connection,
+                    canonical_path=f"packet://{packet_id}/note.md",
+                    kind="user",
+                    checksum=checksum,
+                    object_path=object_path,
+                    normalized_path=normalized_path,
+                )
+                note_revision_id = int(revision["id"])
+            connection.execute(
+                "INSERT INTO packets(id,user_note,note_source_revision_id,created_at,updated_at) "
+                "VALUES (?,?,?,?,?)",
+                (packet_id, note, note_revision_id, now, now),
+            )
+            for item_id, ordinal, name, mime_type, canonical, prepared in prepared_files:
+                checksum, object_path, normalized_path = prepared
+                revision = self._register_text(
+                    connection,
+                    canonical_path=canonical,
+                    kind="file",
+                    checksum=checksum,
+                    object_path=object_path,
+                    normalized_path=normalized_path,
+                )
+                connection.execute(
+                    "INSERT INTO packet_items(id,packet_id,ordinal,kind,display_name,mime_type,"
+                    "source_revision_id,status,created_at) VALUES (?,?,?,?,?,?,?,'ready',?)",
+                    (
+                        item_id,
+                        packet_id,
+                        ordinal,
+                        "file",
+                        name,
+                        mime_type,
+                        int(revision["id"]),
+                        now,
+                    ),
+                )
+            offset = len(prepared_files)
+            for index, url in enumerate(urls):
+                connection.execute(
+                    "INSERT INTO packet_items(id,packet_id,ordinal,kind,display_name,url,status,"
+                    "created_at) VALUES (?,?,?,?,?,?,'waiting_importer',?)",
+                    (
+                        uuid.uuid4().hex[:12],
+                        packet_id,
+                        offset + index,
+                        "url",
+                        url,
+                        url,
+                        now,
+                    ),
+                )
+            if note_revision_id is not None or prepared_files:
+                connection.execute(
+                    "INSERT INTO packet_queue(packet_id,status,attempt_count,available_at,"
+                    "created_at,updated_at) VALUES (?,'queued',0,?,?,?)",
+                    (packet_id, now, now, now),
+                )
+        return self.packet(packet_id)
+
+    def packet(self, packet_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM packets WHERE id = ?", (packet_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown Packet: {packet_id}")
+            items = connection.execute(
+                "SELECT * FROM packet_items WHERE packet_id = ? ORDER BY ordinal", (packet_id,)
+            ).fetchall()
+            job = connection.execute(
+                "SELECT j.* FROM job_packets jp JOIN jobs j ON j.id = jp.job_id "
+                "WHERE jp.packet_id = ? ORDER BY j.created_at DESC LIMIT 1",
+                (packet_id,),
+            ).fetchone()
+            queue = connection.execute(
+                "SELECT * FROM packet_queue WHERE packet_id = ?", (packet_id,)
+            ).fetchone()
+            attempts = connection.execute(
+                "SELECT j.* FROM job_packets jp JOIN jobs j ON j.id = jp.job_id "
+                "WHERE jp.packet_id = ? ORDER BY j.created_at DESC",
+                (packet_id,),
+            ).fetchall()
+            latest_event = None
+            if job is not None:
+                event = connection.execute(
+                    "SELECT * FROM task_events WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                    (job["id"],),
+                ).fetchone()
+                runner_event = connection.execute(
+                    "SELECT * FROM task_events WHERE job_id = ? AND phase = 'runner' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (job["id"],),
+                ).fetchone()
+                if event is not None:
+                    latest_event = {
+                        **dict(event),
+                        "payload": json.loads(str(event["payload_json"])),
+                    }
+                    if runner_event is not None:
+                        runner_payload = json.loads(str(runner_event["payload_json"]))
+                        latest_event["payload"].setdefault("runner", runner_payload.get("runner"))
+                        latest_event["payload"].setdefault("model", runner_payload.get("model"))
+        result = dict(row)
+        result["items"] = [dict(item) for item in items]
+        result["latest_job"] = dict(job) if job else None
+        result["latest_event"] = latest_event
+        result["queue"] = dict(queue) if queue else None
+        result["attempts"] = [dict(attempt) for attempt in attempts]
+        result["processable_count"] = len(self.packet_source_revisions(packet_id))
+        result["waiting_importer_count"] = sum(
+            item["status"] == "waiting_importer" for item in result["items"]
+        )
+        result["state"] = self._packet_state(result)
+        return result
+
+    def packets(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT id FROM packets ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self.packet(str(row["id"])) for row in rows]
+
+    def packet_source_revisions(self, packet_id: str) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            packet = connection.execute(
+                "SELECT note_source_revision_id FROM packets WHERE id = ?", (packet_id,)
+            ).fetchone()
+            if packet is None:
+                raise ValueError(f"Unknown Packet: {packet_id}")
+            items = connection.execute(
+                "SELECT source_revision_id FROM packet_items WHERE packet_id = ? "
+                "AND source_revision_id IS NOT NULL ORDER BY ordinal",
+                (packet_id,),
+            ).fetchall()
+            revision_ids = [
+                int(revision_id)
+                for revision_id in [
+                    packet["note_source_revision_id"],
+                    *(item["source_revision_id"] for item in items),
+                ]
+                if revision_id is not None
+            ]
+            if not revision_ids:
+                return []
+            placeholders = ",".join("?" for _ in revision_ids)
+            rows = connection.execute(
+                "SELECT sr.*, s.canonical_path, s.kind FROM source_revisions sr "
+                "JOIN sources s ON s.id = sr.source_id WHERE sr.id IN ("
+                f"{placeholders}) AND sr.applied_job_id IS NULL",
+                revision_ids,
+            ).fetchall()
+        by_id = {int(row["id"]): dict(row) for row in rows}
+        return [by_id[revision_id] for revision_id in revision_ids if revision_id in by_id]
+
+    def _packet_state(self, packet: dict[str, Any]) -> str:
+        queue = packet.get("queue")
+        if queue:
+            return {
+                "queued": "queued",
+                "running": "processing",
+                "retry_wait": "retry_wait",
+                "review": "review",
+                "done": self._completed_packet_state(packet),
+                "failed": "failed",
+                "idle": "ready",
+            }[str(queue["status"])]
+        job = packet.get("latest_job")
+        if job:
+            status = str(job["status"])
+            return {
+                "running": "processing",
+                "proposed": "review",
+                "applied": "remembered",
+                "no_change": "processed",
+                "failed": "failed",
+                "cancelled": "failed",
+                "rejected": "ready",
+            }.get(status, status)
+        return "ready" if packet["processable_count"] else "waiting_importer"
+
+    @staticmethod
+    def _completed_packet_state(packet: dict[str, Any]) -> str:
+        job = packet.get("latest_job")
+        return "remembered" if job and job["status"] == "applied" else "processed"
+
+    def reconcile_packet_queue(self) -> int:
+        """Create durable queue state for Packets saved by earlier application versions."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT p.id FROM packets p LEFT JOIN packet_queue q ON q.packet_id = p.id "
+                "WHERE q.packet_id IS NULL ORDER BY p.created_at"
+            ).fetchall()
+        inserted = 0
+        for row in rows:
+            packet_id = str(row["id"])
+            if not self.packet_source_revisions(packet_id):
+                continue
+            with self.connection() as connection:
+                latest = connection.execute(
+                    "SELECT j.* FROM job_packets jp JOIN jobs j ON j.id = jp.job_id "
+                    "WHERE jp.packet_id = ? ORDER BY j.created_at DESC LIMIT 1",
+                    (packet_id,),
+                ).fetchone()
+                attempts = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM job_packets WHERE packet_id = ?", (packet_id,)
+                    ).fetchone()[0]
+                )
+                status = (
+                    {
+                        "running": "queued",
+                        "proposed": "review",
+                        "failed": "failed",
+                        "cancelled": "failed",
+                        "rejected": "idle",
+                    }.get(str(latest["status"]), "queued")
+                    if latest
+                    else "queued"
+                )
+                last_error = (
+                    str(latest["rejection_reason"])
+                    if latest and latest["rejection_reason"]
+                    else None
+                )
+                now = utc_now()
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO packet_queue(packet_id,status,attempt_count,"
+                    "available_at,last_job_id,last_error,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        packet_id,
+                        status,
+                        attempts,
+                        now,
+                        str(latest["id"]) if latest else None,
+                        last_error,
+                        now,
+                        now,
+                    ),
+                )
+                inserted += int(cursor.rowcount)
+        return inserted
+
+    def packet_queue(self, packet_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM packet_queue WHERE packet_id = ?", (packet_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def queue_packet(self, packet_id: str, *, reset_attempts: bool = False) -> dict[str, Any]:
+        if not self.packet_source_revisions(packet_id):
+            raise ValueError("Packet has no text sources awaiting processing")
+        now = utc_now()
+        with self.connection() as connection:
+            queue = connection.execute(
+                "SELECT * FROM packet_queue WHERE packet_id = ?", (packet_id,)
+            ).fetchone()
+            if queue is None:
+                connection.execute(
+                    "INSERT INTO packet_queue(packet_id,status,attempt_count,available_at,"
+                    "created_at,updated_at) VALUES (?,'queued',0,?,?,?)",
+                    (packet_id, now, now, now),
+                )
+            elif queue["status"] not in {"queued", "running", "retry_wait", "review"}:
+                connection.execute(
+                    "UPDATE packet_queue SET status = 'queued', attempt_count = ?, "
+                    "available_at = ?, last_error = NULL, updated_at = ? WHERE packet_id = ?",
+                    (0 if reset_attempts else int(queue["attempt_count"]), now, now, packet_id),
+                )
+        queued = self.packet_queue(packet_id)
+        if queued is None:
+            raise ValueError(f"Could not queue Packet: {packet_id}")
+        return queued
+
+    def begin_packet_attempt(self, packet_id: str) -> dict[str, Any]:
+        self.queue_packet(packet_id)
+        now = utc_now()
+        with self.connection() as connection:
+            queue = connection.execute(
+                "SELECT * FROM packet_queue WHERE packet_id = ?", (packet_id,)
+            ).fetchone()
+            if queue is None:
+                raise ValueError(f"Unknown Packet queue: {packet_id}")
+            if queue["status"] == "review":
+                raise ValueError("Packet already has a proposal awaiting review")
+            if queue["status"] != "running":
+                connection.execute(
+                    "UPDATE packet_queue SET status = 'running', "
+                    "attempt_count = attempt_count + 1, available_at = ?, "
+                    "last_error = NULL, updated_at = ? WHERE packet_id = ?",
+                    (now, now, packet_id),
+                )
+        started = self.packet_queue(packet_id)
+        if started is None:
+            raise ValueError(f"Unknown Packet queue: {packet_id}")
+        return started
+
+    def claim_next_packet(self, *, now: str | None = None) -> dict[str, Any] | None:
+        available = now or utc_now()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM packet_queue WHERE "
+                "(status = 'queued' OR (status = 'retry_wait' AND available_at <= ?)) "
+                "AND NOT EXISTS (SELECT 1 FROM jobs WHERE status IN ('running','proposed')) "
+                "ORDER BY available_at, created_at LIMIT 1",
+                (available,),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                "UPDATE packet_queue SET status = 'running', attempt_count = attempt_count + 1, "
+                "last_error = NULL, updated_at = ? WHERE packet_id = ? "
+                "AND status IN ('queued','retry_wait')",
+                (available, row["packet_id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = connection.execute(
+                "SELECT * FROM packet_queue WHERE packet_id = ?", (row["packet_id"],)
+            ).fetchone()
+        return dict(claimed) if claimed else None
+
+    def fail_packet_attempt(
+        self,
+        packet_id: str,
+        *,
+        job_id: str | None,
+        error: str,
+        retryable: bool,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        with self.connection() as connection:
+            queue = connection.execute(
+                "SELECT * FROM packet_queue WHERE packet_id = ?", (packet_id,)
+            ).fetchone()
+            if queue is None:
+                raise ValueError(f"Unknown Packet queue: {packet_id}")
+            attempt = int(queue["attempt_count"])
+            can_retry = retryable and 0 < attempt <= len(PACKET_RETRY_DELAYS_SECONDS)
+            delay = PACKET_RETRY_DELAYS_SECONDS[attempt - 1] if can_retry else 0
+            available_at = (now + timedelta(seconds=delay)).isoformat()
+            connection.execute(
+                "UPDATE packet_queue SET status = ?, available_at = ?, last_job_id = ?, "
+                "last_error = ?, updated_at = ? WHERE packet_id = ?",
+                (
+                    "retry_wait" if can_retry else "failed",
+                    available_at,
+                    job_id,
+                    error,
+                    now.isoformat(),
+                    packet_id,
+                ),
+            )
+        failed = self.packet_queue(packet_id)
+        if failed is None:
+            raise ValueError(f"Unknown Packet queue: {packet_id}")
+        return failed
+
     def pending_revisions(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
@@ -281,6 +711,10 @@ class WikiStorage:
                 "JOIN (SELECT source_id, MAX(revision_no) revision_no FROM source_revisions "
                 "GROUP BY source_id) current ON current.source_id = sr.source_id "
                 "AND current.revision_no = sr.revision_no WHERE sr.applied_job_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM packets p "
+                "WHERE p.note_source_revision_id = sr.id) "
+                "AND NOT EXISTS (SELECT 1 FROM packet_items pi "
+                "WHERE pi.source_revision_id = sr.id) "
                 "ORDER BY sr.id"
             ).fetchall()
         return [dict(row) for row in rows]
@@ -304,6 +738,7 @@ class WikiStorage:
         runner: str,
         source_revision_ids: list[int],
         user_input: str | None = None,
+        packet_id: str | None = None,
     ) -> dict[str, Any]:
         base = self.active_snapshot()
         now = utc_now()
@@ -322,22 +757,42 @@ class WikiStorage:
                 "INSERT INTO job_sources(job_id, source_revision_id) VALUES (?, ?)",
                 [(job_id, revision_id) for revision_id in source_revision_ids],
             )
+            if packet_id is not None:
+                connection.execute(
+                    "INSERT INTO job_packets(job_id,packet_id) VALUES (?,?)",
+                    (job_id, packet_id),
+                )
+                connection.execute(
+                    "UPDATE packet_queue SET last_job_id = ?, updated_at = ? WHERE packet_id = ?",
+                    (job_id, now, packet_id),
+                )
         return self.get_job(job_id)
 
     def recover_interrupted_jobs(self) -> int:
         """Mark jobs abandoned by a terminated process as retryable."""
         with self.connection() as connection:
+            now = utc_now()
             cursor = connection.execute(
                 "UPDATE jobs SET status = 'failed', "
                 "rejection_reason = 'server or CLI process was interrupted', updated_at = ? "
                 "WHERE status = 'running'",
-                (utc_now(),),
+                (now,),
+            )
+            connection.execute(
+                "UPDATE packet_queue SET status = 'queued', available_at = ?, "
+                "last_error = 'analysis was interrupted; it will resume', updated_at = ? "
+                "WHERE status = 'running'",
+                (now, now),
             )
             return int(cursor.rowcount)
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self.connection() as connection:
-            row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            row = connection.execute(
+                "SELECT j.*, jp.packet_id FROM jobs j LEFT JOIN job_packets jp "
+                "ON jp.job_id = j.id WHERE j.id = ?",
+                (job_id,),
+            ).fetchone()
             if row is None:
                 raise ValueError(f"Unknown Wiki proposal: {job_id}")
             sources = connection.execute(
@@ -382,6 +837,53 @@ class WikiStorage:
                 "WHERE id = ?",
                 (revision_no, now, job_id),
             )
+            connection.execute(
+                "UPDATE packet_queue SET status = 'review', available_at = ?, "
+                "last_job_id = ?, last_error = NULL, updated_at = ? "
+                "WHERE packet_id = (SELECT packet_id FROM job_packets WHERE job_id = ?)",
+                (now, job_id, now, job_id),
+            )
+
+    def finish_job_without_changes(
+        self,
+        job_id: str,
+        *,
+        relative_path: str,
+        tree_hash: str,
+        validation_json: str,
+        retrieval_json: str,
+    ) -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT INTO proposal_revisions(job_id,revision_no,relative_path,tree_hash,"
+                "feedback,validation_json,created_at,retrieval_json) "
+                "VALUES (?,1,?,?,NULL,?,?,?)",
+                (
+                    job_id,
+                    relative_path,
+                    tree_hash,
+                    validation_json,
+                    now,
+                    retrieval_json,
+                ),
+            )
+            connection.execute(
+                "UPDATE jobs SET status = 'no_change', current_revision = 1, updated_at = ? "
+                "WHERE id = ?",
+                (now, job_id),
+            )
+            connection.execute(
+                "UPDATE source_revisions SET applied_job_id = ? WHERE id IN "
+                "(SELECT source_revision_id FROM job_sources WHERE job_id = ?)",
+                (job_id, job_id),
+            )
+            connection.execute(
+                "UPDATE packet_queue SET status = 'done', available_at = ?, "
+                "last_job_id = ?, last_error = NULL, updated_at = ? "
+                "WHERE packet_id = (SELECT packet_id FROM job_packets WHERE job_id = ?)",
+                (now, job_id, now, job_id),
+            )
 
     def proposal(self, job_id: str) -> dict[str, Any]:
         job = self.get_job(job_id)
@@ -419,6 +921,15 @@ class WikiStorage:
                 ),
             )
 
+    def latest_successful_call(self, job_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM runner_calls WHERE job_id = ? AND status = 'succeeded' "
+                "ORDER BY id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def activate(self, job_id: str, snapshot_id: str, relative_path: str, tree_hash: str) -> None:
         job = self.get_job(job_id)
         active = self.active_snapshot()
@@ -444,6 +955,12 @@ class WikiStorage:
                 "(SELECT source_revision_id FROM job_sources WHERE job_id = ?)",
                 (job_id, job_id),
             )
+            connection.execute(
+                "UPDATE packet_queue SET status = 'done', available_at = ?, "
+                "last_job_id = ?, last_error = NULL, updated_at = ? "
+                "WHERE packet_id = (SELECT packet_id FROM job_packets WHERE job_id = ?)",
+                (now, job_id, now, job_id),
+            )
 
     def reject(self, job_id: str, reason: str) -> None:
         with self.connection() as connection:
@@ -454,6 +971,12 @@ class WikiStorage:
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Proposal {job_id} is not awaiting review")
+            connection.execute(
+                "UPDATE packet_queue SET status = 'idle', available_at = ?, "
+                "last_job_id = ?, last_error = NULL, updated_at = ? "
+                "WHERE packet_id = (SELECT packet_id FROM job_packets WHERE job_id = ?)",
+                (utc_now(), job_id, utc_now(), job_id),
+            )
 
     def fail_job(self, job_id: str, reason: str) -> None:
         with self.connection() as connection:
@@ -531,7 +1054,11 @@ class WikiStorage:
                 "SELECT COUNT(*) FROM source_revisions sr JOIN "
                 "(SELECT source_id, MAX(revision_no) revision_no FROM source_revisions "
                 "GROUP BY source_id) current ON current.source_id = sr.source_id "
-                "AND current.revision_no = sr.revision_no WHERE sr.applied_job_id IS NULL"
+                "AND current.revision_no = sr.revision_no WHERE sr.applied_job_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM packets p "
+                "WHERE p.note_source_revision_id = sr.id) "
+                "AND NOT EXISTS (SELECT 1 FROM packet_items pi "
+                "WHERE pi.source_revision_id = sr.id)"
             ).fetchone()[0]
             proposal = connection.execute(
                 "SELECT id, status, current_revision FROM jobs "
@@ -544,10 +1071,14 @@ class WikiStorage:
             "proposal": dict(proposal) if proposal else None,
         }
 
-    def jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def jobs(self, limit: int = 50, *, include_packets: bool = True) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+                "SELECT j.*, jp.packet_id FROM jobs j LEFT JOIN job_packets jp "
+                "ON jp.job_id = j.id "
+                + ("" if include_packets else "WHERE jp.packet_id IS NULL ")
+                + "ORDER BY j.created_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -730,6 +1261,20 @@ class WikiStorage:
             shutil.rmtree(old)
         return vault
 
+    def _prepare_text_bytes(self, data: bytes, label: str) -> tuple[str, Path, Path]:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Source is not UTF-8: {label}") from exc
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n").encode()
+        checksum = hashlib.sha256(data).hexdigest()
+        normalized_checksum = hashlib.sha256(normalized).hexdigest()
+        return (
+            checksum,
+            self._store_bytes(data, checksum, "raw"),
+            self._store_bytes(normalized, normalized_checksum, "normalized"),
+        )
+
     def _store_bytes(self, data: bytes, checksum: str, namespace: str) -> Path:
         target = self.objects_dir / namespace / checksum[:2] / checksum
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -749,6 +1294,20 @@ class WikiStorage:
         for name in ("input_tokens", "output_tokens", "cached_input_tokens"):
             if name not in columns:
                 connection.execute(f"ALTER TABLE runner_calls ADD COLUMN {name} INTEGER")
+
+    def _apply_migrations(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+        )
+        applied = {
+            int(row["version"])
+            for row in connection.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        for path in sorted(MIGRATIONS.glob("[0-9][0-9][0-9]_wiki_first_*.sql")):
+            version = int(path.name.split("_", 1)[0])
+            if version not in applied:
+                connection.executescript(path.read_text(encoding="utf-8"))
 
     def _ensure_proposal_columns(self, connection: sqlite3.Connection) -> None:
         columns = {

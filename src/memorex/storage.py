@@ -51,7 +51,7 @@ class Storage:
             }
             migration_root = importlib.resources.files("memorex.migrations")
             for migration in sorted(migration_root.iterdir(), key=lambda item: item.name):
-                if migration.suffix != ".sql":
+                if migration.suffix != ".sql" or "_wiki_first_" in migration.name:
                     continue
                 version = int(migration.name.split("_", 1)[0])
                 if version in applied:
