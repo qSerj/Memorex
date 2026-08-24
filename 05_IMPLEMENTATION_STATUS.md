@@ -53,6 +53,9 @@ Packet → local immutable save → persistent queue → whole-document strong-a
   выдумывается, поскольку agent CLI не сообщает достоверную долю готовности.
 - Если runner уже закончил содержательную работу, но локальная сборка proposal упала, повторный
   запуск сначала проверяет и восстанавливает сохранённый stage без нового модельного вызова.
+- Web-страница «Перенос» создаёт полный `.memorex.zip` с согласованными SQLite-копиями и
+  восстанавливает его в новую или существующую папку. Перед полной заменой существующий workspace
+  автоматически сохраняется в соседней `.memorex-backups/`; merge намеренно отсутствует.
 - Поддерживаемые тексты передаются в один proposal; URL пока ожидают importer, а no-op обработка не
   создаёт идентичный snapshot.
 - Лог runner, model, CLI version, prompt version, duration, stdout/stderr и failure; секреты не
@@ -89,15 +92,17 @@ Packet → local immutable save → persistent queue → whole-document strong-a
    снова и убедиться, что Packet дообрабатывается без потери или дубликата.
 2. Проверить Packets на коротких заметках и связанных наборах файлов, включая материал, который
    агент разумно не переносит в Wiki.
-3. Отдельно согласовать минимальный слой Commitments с provenance и коротким подтверждением
+3. Проверить полный архив реального workspace переносом в другой абсолютный путь и обратным
+   восстановлением страховочной копии.
+4. Отдельно согласовать минимальный слой Commitments с provenance и коротким подтверждением
    неуверенных действий; не добавлять Attention/reminder delivery заранее.
-4. Freeze the pending Claude output on the tracked synthetic fixture after its CLI quota resets;
+5. Freeze the pending Claude output on the tracked synthetic fixture after its CLI quota resets;
    the Codex baseline, incremental Wiki and query answer are already frozen.
-5. Use the CLI on a small real ignored corpus; inspect the proposal in Obsidian and apply only after
+6. Use the CLI on a small real ignored corpus; inspect the proposal in Obsidian and apply only after
    human review.
-6. Add a second real material on existing topics and judge accumulation, bloat, contradictions and
+7. Add a second real material on existing topics and judge accumulation, bloat, contradictions and
    provenance honestly.
-7. Compare new outputs against the frozen Codex/Claude references. Change prompts or organization
+8. Compare new outputs against the frozen Codex/Claude references. Change prompts or organization
    before adding retrieval infrastructure if the Wiki is not intelligent enough.
-8. Extract a stable application-service boundary for a future Telegram administrator only after the
+9. Extract a stable application-service boundary for a future Telegram administrator only after the
    CLI interaction proves useful.

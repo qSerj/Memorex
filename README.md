@@ -56,8 +56,15 @@ uv run memorex app ./my-knowledge
 ```
 
 Приложение доступно только на `127.0.0.1`, использует локальные Jinja/CSS/JS и содержит Wiki,
-Inbox, обязательный Review, сохраняемый Chat и History. После Apply/Rollback оно атомарно обновляет
-read-only Obsidian vault в `WORKSPACE/vault/`; любые ручные правки vault заменяются при Refresh.
+Inbox, обязательный Review, сохраняемый Chat, History и страницу «Перенос». После Apply/Rollback
+оно атомарно обновляет read-only Obsidian vault в `WORKSPACE/vault/`; любые ручные правки vault
+заменяются при Refresh.
+
+Страница «Перенос» скачивает весь workspace одним `.memorex.zip`: конфигурацию, Inbox, обе SQLite
+базы, Packets, очередь, originals, Wiki snapshots, jobs, Chat и vault. Этот архив можно восстановить
+в новую папку на другом компьютере или целиком поверх существующего Memorex workspace. Перед
+заменой существующая база автоматически архивируется в соседнюю `.memorex-backups/`; слияния двух
+баз первая версия не делает. Backup/restore недоступен, пока выполняется анализ или query.
 
 Экран «Добавить» сохраняет Packet — один необязательный комментарий, несколько TXT/Markdown и
 несколько URL. Локальное сохранение подтверждается сразу и не ждёт модель; после этого страницу

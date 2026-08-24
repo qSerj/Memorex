@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -14,15 +15,27 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from memorex.config import WorkspaceSettings
 from memorex.wiki_first.service import RunnerResolver, WikiFirstError, WikiFirstService
+from memorex.workspace_archive import (
+    WorkspaceArchiveError,
+    create_workspace_archive,
+    restore_workspace_archive,
+)
 
 TEMPLATES = Path(__file__).with_name("wiki_templates")
 STATIC = Path(__file__).with_name("wiki_static")
@@ -70,6 +83,7 @@ class WorkspaceTasks:
         self.futures: dict[str, Future[object]] = {}
         self.kinds: dict[str, str] = {}
         self.queue_wake = threading.Event()
+        self.queue_paused = threading.Event()
         self.shutdown_event = threading.Event()
         self.queue_thread: threading.Thread | None = None
         self.task_lock = threading.RLock()
@@ -144,7 +158,11 @@ class WorkspaceTasks:
                 continue
             try:
                 with self.task_lock:
-                    if self.mutation_busy() or storage.status()["proposal"] is not None:
+                    if (
+                        self.queue_paused.is_set()
+                        or self.mutation_busy()
+                        or storage.status()["proposal"] is not None
+                    ):
                         continue
                     queued = storage.claim_next_packet()
                     if queued is not None:
@@ -158,6 +176,18 @@ class WorkspaceTasks:
                 self.kinds.get(task_id) != "query" and not future.done()
                 for task_id, future in self.futures.items()
             )
+
+    def pause_for_maintenance(self) -> bool:
+        with self.task_lock:
+            self.queue_paused.set()
+            if any(not future.done() for future in self.futures.values()):
+                self.queue_paused.clear()
+                return False
+            return True
+
+    def resume_after_maintenance(self) -> None:
+        self.queue_paused.clear()
+        self.wake_queue()
 
     def stop(self, task_id: str) -> bool:
         with self.task_lock:
@@ -272,6 +302,84 @@ def create_app(
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return RedirectResponse("/", status_code=303)
+
+    @app.get("/transfer", response_class=HTMLResponse)
+    async def transfer(request: Request) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request=request,
+            name="app.html",
+            context=context(
+                request,
+                "transfer",
+                restored=request.query_params.get("restored"),
+                safety_backup=request.query_params.get("safety_backup"),
+            ),
+        )
+
+    @app.post("/workspace/backup")
+    async def backup_workspace() -> Response:
+        settings: WorkspaceSettings = state["settings"]
+        if settings is None:
+            raise HTTPException(409, "Choose a workspace first")
+        tasks: WorkspaceTasks = state["tasks"]
+        if not tasks.pause_for_maintenance():
+            raise HTTPException(409, "Wait for the current analysis or query to finish")
+        handle, temporary_name = tempfile.mkstemp(prefix="memorex-backup-", suffix=".zip")
+        os.close(handle)
+        temporary = Path(temporary_name)
+        temporary.unlink()
+        try:
+            create_workspace_archive(settings.root, temporary)
+        except (OSError, sqlite3.Error, WorkspaceArchiveError) as exc:
+            temporary.unlink(missing_ok=True)
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            tasks.resume_after_maintenance()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", settings.root.name).strip("-")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{safe_name or 'memorex'}-{timestamp}.memorex.zip"
+        try:
+            content = temporary.read_bytes()
+        finally:
+            temporary.unlink(missing_ok=True)
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.post("/workspace/restore")
+    async def restore_workspace(
+        path: Annotated[str, Form()], archive: Annotated[UploadFile, File()]
+    ) -> RedirectResponse:
+        handle, temporary_name = tempfile.mkstemp(prefix="memorex-restore-", suffix=".zip")
+        old_tasks: WorkspaceTasks | None = state.get("tasks")
+        paused = False
+        switched = False
+        try:
+            with os.fdopen(handle, "wb") as output:
+                while chunk := await archive.read(1024 * 1024):
+                    output.write(chunk)
+            if old_tasks is not None:
+                paused = old_tasks.pause_for_maintenance()
+                if not paused:
+                    raise HTTPException(409, "Wait for the current analysis or query to finish")
+            result = restore_workspace_archive(Path(temporary_name), Path(path))
+            select(result.root)
+            switched = True
+        except HTTPException:
+            raise
+        except (OSError, sqlite3.Error, WorkspaceArchiveError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            await archive.close()
+            Path(temporary_name).unlink(missing_ok=True)
+            if paused and not switched and old_tasks is not None:
+                old_tasks.resume_after_maintenance()
+        parameters = {"restored": "1"}
+        if result.safety_backup is not None:
+            parameters["safety_backup"] = str(result.safety_backup)
+        return RedirectResponse(f"/transfer?{urlencode(parameters)}", status_code=303)
 
     @app.get("/wiki/{slug}", response_class=HTMLResponse)
     async def wiki_page(request: Request, slug: str) -> HTMLResponse:

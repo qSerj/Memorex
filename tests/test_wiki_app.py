@@ -86,6 +86,51 @@ def test_web_setup_upload_last_workspace_and_safe_markdown(tmp_path: Path) -> No
     assert 'href="/wiki/topic"' in rendered
 
 
+def test_web_downloads_and_restores_full_workspace(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Portable Web")
+    service = WikiFirstService(settings, runner_resolver=lambda _name: RetrievalRunner())
+    original = service.create_packet(
+        user_note="Запись из скачанной копии.", files=[], urls=["https://example.com/original"]
+    )
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: RetrievalRunner(),
+        user_settings_path=tmp_path / "preferences.json",
+    )
+
+    async def exercise() -> None:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+            transfer = await client.get("/transfer")
+            assert "Скачать полную копию" in transfer.text
+            downloaded = await client.post("/workspace/backup")
+            assert downloaded.status_code == 200
+            assert downloaded.headers["content-type"] == "application/zip"
+            assert ".memorex.zip" in downloaded.headers["content-disposition"]
+
+            added = await client.post(
+                "/packets",
+                data={"urls": "https://example.com/added-after-backup"},
+            )
+            assert added.status_code == 303
+            assert len(WikiStorage(settings).packets()) == 2
+
+            restored = await client.post(
+                "/workspace/restore",
+                data={"path": str(settings.root)},
+                files={"archive": ("portable.memorex.zip", downloaded.content, "application/zip")},
+            )
+            assert restored.status_code == 303
+            receipt = await client.get(restored.headers["location"])
+            assert "Полная копия восстановлена" in receipt.text
+            assert ".memorex-backups" in receipt.text
+
+    asyncio.run(exercise())
+    packets = WikiStorage(WorkspaceSettings.load(settings.root)).packets()
+    assert [packet["id"] for packet in packets] == [original["id"]]
+    assert list((tmp_path / ".memorex-backups").glob("*.memorex.zip"))
+
+
 def test_retrieval_hides_irrelevant_pages_and_merge_preserves_them(tmp_path: Path) -> None:
     settings = WorkspaceSettings.create(tmp_path / "workspace", "Test")
     runner = RetrievalRunner()
