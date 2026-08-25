@@ -12,6 +12,7 @@ from memorex.wiki_first.service import WikiFirstService
 from memorex.wiki_first.storage import WikiStorage
 from memorex.workspace_archive import (
     WorkspaceArchiveError,
+    create_readable_export,
     create_workspace_archive,
     restore_workspace_archive,
 )
@@ -103,3 +104,29 @@ def test_restore_rejects_paths_escaping_the_workspace(tmp_path: Path) -> None:
 
     assert not (tmp_path / "escaped.txt").exists()
     assert not (tmp_path / "target").exists()
+
+
+def test_readable_export_contains_human_files_without_runtime_database(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "source", "Readable memory")
+    service = WikiFirstService(settings)
+    service.initialize()
+    inbox = next(item for item in service.storage.notebooks() if item["system_key"] == "inbox")
+    note = service.create_note("Readable note", "Body for a human.", str(inbox["id"]))
+    attachment = service.storage.add_note_attachment(
+        str(note["id"]), name="document.pdf", mime_type="application/pdf", data=b"pdf bytes"
+    )
+    export = create_readable_export(settings.root, tmp_path / "readable.zip")
+
+    with ZipFile(export) as bundle:
+        names = set(bundle.namelist())
+        index = bundle.read("README.md").decode()
+        note_text = bundle.read(f"notes/{note['slug']}.md").decode()
+        attachment_name = f"attachments/{note['slug']}/{attachment['id']}-document.pdf"
+        assert "Readable memory" in index
+        assert "Readable note" in index
+        assert "Body for a human." in note_text
+        assert "## Приложенные файлы" in note_text
+        assert bundle.read(attachment_name) == b"pdf bytes"
+        assert not any(name.endswith((".sqlite", ".db")) for name in names)
+        assert "manifest.json" not in names
+        assert not any("jobs" in name for name in names)

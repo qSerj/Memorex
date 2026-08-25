@@ -239,6 +239,73 @@ def test_ingest_prompt_requests_compact_lists_and_logs(tmp_path: Path) -> None:
     assert "watchlists" in runner.calls[-1]
     assert "stable chronological" in runner.calls[-1]
     assert "Do not add boilerplate open questions" in runner.calls[-1]
+    assert "existing note defines its own local schema" in runner.calls[-1].lower()
+    assert "smallest change" in runner.calls[-1]
+
+
+def test_workspace_model_profiles_have_portable_defaults(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Profiles")
+
+    assert settings.wiki.simple_profile.model == "gpt-5.6-luna"
+    assert settings.wiki.simple_profile.effort == "medium"
+    assert settings.wiki.standard_profile.model == "gpt-5.6-terra"
+    assert settings.wiki.fallback_profile.runner == "claude"
+    assert settings.wiki.fallback_profile.model == "sonnet"
+
+
+def test_small_ingest_uses_simple_profile_and_semantic_fallback_uses_standard(
+    tmp_path: Path,
+) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Routing")
+    good = FakeWikiRunner("codex")
+    resolved = 0
+
+    def resolver(_name: str) -> AgentRunner:
+        nonlocal resolved
+        resolved += 1
+        return ContractBreakingRunner() if resolved == 1 else good
+
+    service = WikiFirstService(settings, runner_resolver=resolver)
+    packet = service.create_packet(user_note="Добавить один фильм.", files=[], urls=[])
+    result = service.ingest_packet(str(packet["id"]))
+
+    with sqlite3.connect(service.storage.database_path) as connection:
+        calls = connection.execute(
+            "SELECT profile, effort FROM runner_calls WHERE job_id = ? ORDER BY id",
+            (result["job_id"],),
+        ).fetchall()
+    assert calls == [("simple", "medium"), ("standard", "medium")]
+
+
+def test_multiple_sources_use_standard_profile_and_codex_failure_uses_claude(
+    tmp_path: Path,
+) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Routing")
+    good = FakeWikiRunner("claude")
+
+    def resolver(name: str) -> AgentRunner:
+        return FailingRunner("codex") if name == "codex" else good
+
+    service = WikiFirstService(settings, runner_resolver=resolver)
+    packet = service.create_packet(
+        user_note="Эти два файла связаны.",
+        files=[
+            ("one.txt", "text/plain", b"One.\nMore.\n"),
+            ("two.txt", "text/plain", b"Two.\nMore.\n"),
+        ],
+        urls=[],
+    )
+    result = service.ingest_packet(str(packet["id"]))
+
+    with sqlite3.connect(service.storage.database_path) as connection:
+        calls = connection.execute(
+            "SELECT profile, runner, effort FROM runner_calls WHERE job_id = ? ORDER BY id",
+            (result["job_id"],),
+        ).fetchall()
+    assert calls == [
+        ("standard", "codex", "medium"),
+        ("fallback", "claude", "medium"),
+    ]
 
 
 def test_local_notes_edit_search_notebooks_and_attachments_without_ai(tmp_path: Path) -> None:

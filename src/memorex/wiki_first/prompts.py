@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-INGEST_PROMPT_VERSION = "wiki-first-ingest-v5"
-REVISE_PROMPT_VERSION = "wiki-first-revise-v2"
+INGEST_PROMPT_VERSION = "wiki-first-ingest-v6"
+REVISE_PROMPT_VERSION = "wiki-first-revise-v3"
 QUERY_PROMPT_VERSION = "wiki-first-query-v1"
 
 
@@ -57,6 +57,13 @@ details are illegible. Image citations link directly to the image and never clai
 The result is not one summary per source and not a claim database. Prefer a small set of durable
 pages. Update an existing page when the subject already exists. Create a page only for a
 long-lived topic worth revisiting. Choose the page shape from the user's intent and the material:
+
+An existing note defines its own local schema. Before editing it, read the whole page and make the
+smallest change that satisfies the user's intent. Preserve its headings, section order, table
+columns, list style, voice, links, and source footer. Append a row to an existing table or an item
+to an existing list. Do not rewrite unrelated text, introduce a competing structure, or create a
+second page for the same accumulating subject. Retrieved pages are candidates, not permission to
+edit all of them.
 
 - personal collections, watchlists, wishlists, and recommendations are compact accumulating
   lists or tables; add one item, not an essay about how it was captured;
@@ -120,6 +127,10 @@ Lists, logs, and tables must stay compact; remove meta-commentary, capture narra
 questions, and unnecessary hypotheses. Update proposal-report.md with what changed in this
 revision and run a complete self-check. Keep the report under 300 words. Do not just explain what
 you would change.
+
+An existing note is the schema for its revision: preserve its headings, section order, table
+columns, list style, voice, links, and source footer. Make the smallest requested patch and leave
+unrelated text byte-for-byte unchanged whenever possible.
 """
 
 

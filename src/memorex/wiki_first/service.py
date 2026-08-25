@@ -14,8 +14,14 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
-from memorex.config import WorkspaceSettings
-from memorex.wiki_first.models import AgentRunner, PacketUpload, ProposalActions, RunnerResult
+from memorex.config import ModelProfileSettings, WorkspaceSettings
+from memorex.wiki_first.models import (
+    AgentRunner,
+    PacketUpload,
+    ProposalActions,
+    RunnerResult,
+    RunnerSpec,
+)
 from memorex.wiki_first.prompts import (
     INGEST_PROMPT_VERSION,
     QUERY_PROMPT_VERSION,
@@ -24,7 +30,12 @@ from memorex.wiki_first.prompts import (
     query_prompt,
     revise_prompt,
 )
-from memorex.wiki_first.runners import RunnerCancelled, RunnerError, configured_runner
+from memorex.wiki_first.runners import (
+    RunnerCancelled,
+    RunnerError,
+    configured_profile_runner,
+    configured_runner,
+)
 from memorex.wiki_first.storage import WikiStorage, hash_tree
 from memorex.wiki_first.validation import validate_wiki
 
@@ -59,12 +70,24 @@ class WikiFirstService:
     ):
         self.settings = settings
         self.storage = WikiStorage(settings)
-        self._runner_resolver = runner_resolver or (
-            lambda name: configured_runner(settings.wiki, name)
-        )
+        self._runner_resolver = runner_resolver
         self._progress, self._cancel_event, self._task_id = progress, cancel_event, task_id
         self._job_id: str | None = None
         self._started = time.monotonic()
+
+    def _resolve_runner(self, spec: RunnerSpec) -> AgentRunner:
+        if self._runner_resolver is not None:
+            return self._runner_resolver(spec.runner)
+        return configured_profile_runner(spec)
+
+    def _runner_spec(self, profile: str, override: str | None = None) -> RunnerSpec:
+        if override is not None:
+            _validate_runner_name(override)
+            runner = configured_runner(self.settings.wiki, override)
+            return RunnerSpec("explicit", runner.name, runner.model, runner.effort)
+        configured: ModelProfileSettings = getattr(self.settings.wiki, f"{profile}_profile")
+        _validate_runner_name(configured.runner)
+        return RunnerSpec(profile, configured.runner, configured.model, configured.effort)
 
     def _emit(self, phase: str, **payload: object) -> None:
         event = {
@@ -182,23 +205,23 @@ class WikiFirstService:
         self.storage.initialize()
         self.storage.recover_interrupted_jobs()
         self.storage.verify_active()
-        runner = runner_name or self.settings.wiki.ingest_runner
-        _validate_runner_name(runner)
+        if runner_name is not None:
+            _validate_runner_name(runner_name)
         self._emit("scan")
         scanned, pending = self.scan(), self.storage.pending_revisions()
         if not pending:
             return {"status": "unchanged", "scanned": scanned, "pending_sources": 0}
-        return self._create_proposal("ingest", pending, runner, None)
+        return self._create_proposal("ingest", pending, runner_name, None)
 
     def tell(self, text: str, *, runner_name: str | None = None) -> dict[str, object]:
         self.storage.initialize()
         self.storage.recover_interrupted_jobs()
         self.storage.verify_active()
-        runner = runner_name or self.settings.wiki.ingest_runner
-        _validate_runner_name(runner)
+        if runner_name is not None:
+            _validate_runner_name(runner_name)
         revision = self.storage.register_user_text(text, "note")
         return self._create_proposal(
-            "tell", [self.storage.source_revision(int(revision["id"]))], runner, text
+            "tell", [self.storage.source_revision(int(revision["id"]))], runner_name, text
         )
 
     def create_packet(
@@ -240,8 +263,8 @@ class WikiFirstService:
         if not queue_claimed:
             self.storage.recover_interrupted_jobs()
         self.storage.verify_active()
-        runner = runner_name or self.settings.wiki.ingest_runner
-        _validate_runner_name(runner)
+        if runner_name is not None:
+            _validate_runner_name(runner_name)
         try:
             packet = self.storage.packet(packet_id)
         except ValueError as exc:
@@ -259,7 +282,7 @@ class WikiFirstService:
             return self._create_proposal(
                 "packet",
                 pending,
-                runner,
+                runner_name,
                 str(packet["user_note"]) or None,
                 packet_id=packet_id,
             )
@@ -393,7 +416,7 @@ class WikiFirstService:
             raise WikiFirstError(f"Proposal {job_id} is not awaiting review")
         if runner_name is not None:
             _validate_runner_name(runner_name)
-        runner_name = runner_name or str(proposal["runner"])
+        spec = self._runner_spec("standard", runner_name)
         old = self.storage.root / str(proposal["relative_path"])
         revision = int(proposal["revision_no"]) + 1
         stage = self.storage.jobs_dir / job_id / f"rev-{revision}"
@@ -405,29 +428,48 @@ class WikiFirstService:
             slug = Path(name).stem
             if slug not in selected and len(selected) < 12:
                 selected.append(slug)
-        self._prepare_subset(stage, old, selected, [])
-        report = old / "proposal-report.md"
-        if report.is_file():
-            shutil.copy2(report, stage / "proposal-report.md")
         retrieval = self._retrieval(selected, old / "wiki")
         self._emit("retrieval", **retrieval)
         self.storage.set_job_status(job_id, "running")
         try:
-            result = self._run_and_log(
-                self._runner_resolver(runner_name),
-                stage,
-                revise_prompt(feedback),
-                True,
-                job_id,
-                "revise",
-                REVISE_PROMPT_VERSION,
-            )
-            self._merge_stage(old, stage)
-            validation = self._validate_stage(stage, proposal)
-            if not validation["valid"]:
-                raise WikiFirstError(
-                    "Revised proposal is invalid: " + "; ".join(validation["errors"])
-                )
+            result: RunnerResult | None = None
+            validation: dict[str, object] | None = None
+            last_error: Exception | None = None
+            for attempt, candidate in enumerate(
+                (spec, self._fallback_spec(spec, technical=True)), start=1
+            ):
+                if stage.exists():
+                    _make_writable(stage)
+                    shutil.rmtree(stage)
+                self._prepare_subset(stage, old, selected, [])
+                report = old / "proposal-report.md"
+                if report.is_file():
+                    shutil.copy2(report, stage / "proposal-report.md")
+                if attempt == 2:
+                    self._emit("fallback", fallback=candidate.runner)
+                try:
+                    result = self._run_and_log(
+                        self._resolve_runner(candidate),
+                        stage,
+                        revise_prompt(feedback),
+                        True,
+                        job_id,
+                        "revise",
+                        REVISE_PROMPT_VERSION,
+                        spec=candidate,
+                    )
+                    self._merge_stage(old, stage)
+                    validation = self._validate_stage(stage, proposal)
+                    if not validation["valid"]:
+                        raise WikiFirstError(
+                            "Revised proposal is invalid: " + "; ".join(validation["errors"])
+                        )
+                    break
+                except (RunnerError, OSError, ValidationError, WikiFirstError) as exc:
+                    last_error = exc
+            if result is None or validation is None or not validation["valid"]:
+                assert last_error is not None
+                raise last_error
             self.storage.add_proposal_revision(
                 job_id,
                 revision_no=revision,
@@ -597,7 +639,7 @@ class WikiFirstService:
         return self._create_proposal(
             str(job["kind"]),
             pending,
-            str(job["runner"]),
+            None,
             job.get("user_input"),
             packet_id=packet_id,
         )
@@ -607,8 +649,7 @@ class WikiFirstService:
     ) -> dict[str, object]:
         if not question.strip():
             raise WikiFirstError("Question must not be empty")
-        runner_name = runner_name or self.settings.wiki.query_runner
-        _validate_runner_name(runner_name)
+        spec = self._runner_spec("standard", runner_name)
         self.storage.initialize()
         self.storage.verify_active()
         snapshot = self.storage.active_snapshot()
@@ -645,19 +686,11 @@ class WikiFirstService:
         _make_read_only(workdir / "wiki")
         _make_read_only(workdir / "sources")
         self._emit("retrieval", **self._retrieval(selected, source / "wiki"))
-        result = self._run_and_log(
-            self._runner_resolver(runner_name),
+        result, answer = self._run_query_with_fallback(
             workdir,
             query_prompt(question, context=_chat_context(history)),
-            True,
-            None,
-            "query",
-            QUERY_PROMPT_VERSION,
+            spec,
         )
-        answer_path = workdir / "answer.md"
-        if not answer_path.is_file() or not answer_path.read_text(encoding="utf-8").strip():
-            raise WikiFirstError("Query runner did not create answer.md")
-        answer = answer_path.read_text(encoding="utf-8").strip()
         record = self.storage.record_answer(
             snapshot_id=str(snapshot["id"]),
             question=question,
@@ -686,8 +719,7 @@ class WikiFirstService:
     def answer_discussion_turn(
         self, turn_id: str, *, runner_name: str | None = None
     ) -> dict[str, object]:
-        runner_name = runner_name or self.settings.wiki.query_runner
-        _validate_runner_name(runner_name)
+        spec = self._runner_spec("standard", runner_name)
         turn = self.storage.discussion_turn(turn_id)
         snapshot = self._snapshot(str(turn["snapshot_id"]))
         note_ids = list(turn["note_ids"])
@@ -722,23 +754,15 @@ class WikiFirstService:
             "retrieval",
             **self._retrieval(selected, source / "wiki"),
         )
-        result = self._run_and_log(
-            self._runner_resolver(runner_name),
+        result, answer = self._run_query_with_fallback(
             workdir,
             query_prompt(
                 str(turn["question"]),
                 context=_chat_context(history[:-1]) + attachment_context,
             ),
-            True,
-            None,
-            "query",
-            QUERY_PROMPT_VERSION,
+            spec,
             images=images,
         )
-        answer_path = workdir / "answer.md"
-        if not answer_path.is_file() or not answer_path.read_text(encoding="utf-8").strip():
-            raise WikiFirstError("Query runner did not create answer.md")
-        answer = answer_path.read_text(encoding="utf-8").strip()
         answer_id = self.storage.finish_discussion_turn(
             turn_id, answer, runner=result.runner, model=result.model
         )
@@ -809,7 +833,7 @@ class WikiFirstService:
         self,
         kind: str,
         pending: list[dict[str, object]],
-        runner_name: str,
+        runner_name: str | None,
         user_input: str | None,
         *,
         packet_id: str | None = None,
@@ -820,7 +844,7 @@ class WikiFirstService:
             job = self.storage.create_job(
                 job_id,
                 kind=kind,
-                runner=runner_name,
+                runner=runner_name or "auto",
                 source_revision_ids=[int(x["id"]) for x in pending],
                 user_input=user_input,
                 packet_id=packet_id,
@@ -855,19 +879,22 @@ class WikiFirstService:
             selected_pages=selected,
             packet=packet_id is not None,
         )
+        primary_spec = self._ingest_spec(pending, user_input, selected, runner_name)
+        self.storage.set_job_runner(job_id, primary_spec.runner)
         result = None
         validation = None
         last_error: Exception | None = None
         last_retryable = False
-        for candidate in (runner_name, "codex" if runner_name == "claude" else "claude"):
+        candidate = primary_spec
+        for attempt in range(2):
             try:
-                if candidate != runner_name:
-                    self._emit("fallback", fallback=candidate)
+                if attempt:
+                    self._emit("fallback", fallback=candidate.profile)
                     _make_writable(stage)
                     shutil.rmtree(stage)
                     self._prepare_subset(stage, base, selected, pending)
                 result = self._run_and_log(
-                    self._runner_resolver(candidate),
+                    self._resolve_runner(candidate),
                     stage,
                     prompt,
                     True,
@@ -875,6 +902,7 @@ class WikiFirstService:
                     "ingest",
                     INGEST_PROMPT_VERSION,
                     images=images,
+                    spec=candidate,
                 )
                 self._merge_stage(base, stage)
                 validation = self._validate_stage(stage, job)
@@ -890,6 +918,8 @@ class WikiFirstService:
             except (RunnerError, WikiFirstError, OSError) as exc:
                 last_error = exc
                 last_retryable = isinstance(exc, RunnerError)
+            if attempt == 0:
+                candidate = self._fallback_spec(primary_spec, technical=last_retryable)
         if result is None or validation is None or not validation["valid"]:
             self.storage.fail_job(job_id, str(last_error or "proposal failed"))
             raise WikiFirstProcessingError(
@@ -927,6 +957,39 @@ class WikiFirstService:
         )
         self._emit("review-ready", job_id=job_id, status="proposed")
         return self._proposal_result(job_id, result)
+
+    def _ingest_spec(
+        self,
+        pending: list[dict[str, object]],
+        user_input: str | None,
+        selected: list[str],
+        override: str | None,
+    ) -> RunnerSpec:
+        if override is not None:
+            return self._runner_spec("standard", override)
+        thematic = [slug for slug in selected if slug != "README"]
+        material = [item for item in pending if item.get("kind") != "user"]
+        instruction_size = sum(
+            len(str(item.get("analysis_instruction") or "")) for item in material
+        )
+        simple = (
+            len(material) <= 1
+            and len(user_input or "") + instruction_size <= 1_000
+            and len(thematic) <= 1
+            and (not material or self._source_size(material[0]) <= 8_000)
+        )
+        return self._runner_spec("simple" if simple else "standard")
+
+    def _source_size(self, item: dict[str, object]) -> int:
+        if item.get("kind") == "image":
+            return 0
+        path = self.storage.root / str(item["normalized_path"])
+        return len(path.read_text(encoding="utf-8"))
+
+    def _fallback_spec(self, primary: RunnerSpec, *, technical: bool) -> RunnerSpec:
+        if primary.profile == "simple" and not technical:
+            return self._runner_spec("standard")
+        return self._runner_spec("fallback")
 
     def _source_terms(self, pending: list[dict[str, object]]) -> str:
         chunks = []
@@ -1069,6 +1132,7 @@ class WikiFirstService:
         purpose: str,
         prompt_version: str,
         images: list[Path] | None = None,
+        spec: RunnerSpec | None = None,
     ) -> RunnerResult:
         self._emit("runner", runner=runner.name, model=runner.model)
         try:
@@ -1101,6 +1165,8 @@ class WikiFirstService:
                     "input_tokens": failed.input_tokens if failed else None,
                     "output_tokens": failed.output_tokens if failed else None,
                     "cached_input_tokens": failed.cached_input_tokens if failed else None,
+                    "profile": spec.profile if spec else None,
+                    "effort": spec.effort if spec else None,
                 }
             )
             raise
@@ -1119,9 +1185,45 @@ class WikiFirstService:
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
                 "cached_input_tokens": result.cached_input_tokens,
+                "profile": spec.profile if spec else None,
+                "effort": spec.effort if spec else None,
             }
         )
         return result
+
+    def _run_query_with_fallback(
+        self,
+        workdir: Path,
+        prompt: str,
+        primary: RunnerSpec,
+        *,
+        images: list[Path] | None = None,
+    ) -> tuple[RunnerResult, str]:
+        last_error: Exception | None = None
+        for attempt, spec in enumerate((primary, self._runner_spec("fallback"))):
+            answer_path = workdir / "answer.md"
+            if answer_path.exists():
+                answer_path.unlink()
+            if attempt:
+                self._emit("fallback", fallback=spec.profile)
+            try:
+                result = self._run_and_log(
+                    self._resolve_runner(spec),
+                    workdir,
+                    prompt,
+                    True,
+                    None,
+                    "query",
+                    QUERY_PROMPT_VERSION,
+                    images=images,
+                    spec=spec,
+                )
+                if answer_path.is_file() and answer_path.read_text(encoding="utf-8").strip():
+                    return result, answer_path.read_text(encoding="utf-8").strip()
+                last_error = WikiFirstError("Query runner did not create answer.md")
+            except (RunnerError, WikiFirstError, OSError) as exc:
+                last_error = exc
+        raise WikiFirstError(f"Both query runners failed: {last_error}")
 
     def _proposal_result(self, job_id: str, result: RunnerResult) -> dict[str, object]:
         review = self.review(job_id)

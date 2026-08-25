@@ -32,6 +32,14 @@ class PacketUpload:
 
 
 @dataclass(frozen=True)
+class RunnerSpec:
+    profile: str
+    runner: str
+    model: str
+    effort: str
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

@@ -66,7 +66,7 @@ def test_web_setup_upload_last_workspace_and_safe_markdown(tmp_path: Path) -> No
     async def exercise() -> None:
         transport = httpx2.ASGITransport(app=create_app(None, user_settings_path=preferences))
         async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
-            assert "Создайте новый workspace" in (await client.get("/")).text
+            assert "Локальная внешняя память" in (await client.get("/")).text
             created = await client.post(
                 "/workspace",
                 data={"path": str(tmp_path / "knowledge"), "action": "create", "name": "Test"},
@@ -159,7 +159,11 @@ def test_web_downloads_and_restores_full_workspace(tmp_path: Path) -> None:
         transport = httpx2.ASGITransport(app=app)
         async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             transfer = await client.get("/transfer")
-            assert "Скачать полную копию" in transfer.text
+            assert "Полная резервная копия" in transfer.text
+            assert "Скачать читаемую копию" in transfer.text
+            readable = await client.post("/workspace/export-readable")
+            assert readable.status_code == 200
+            assert ".readable.zip" in readable.headers["content-disposition"]
             downloaded = await client.post("/workspace/backup")
             assert downloaded.status_code == 200
             assert downloaded.headers["content-type"] == "application/zip"
@@ -212,7 +216,7 @@ def test_web_exposes_memory_question_and_literal_review_editor(tmp_path: Path) -
             assert "Найти в заголовках и тексте" in home
             review = (await client.get(f"/review?job={job_id}")).text
             assert "Редактировать Markdown вручную" in review
-            assert "Переделать моделью" in review
+            assert "Переделать с AI" in review
             saved = await client.post(
                 f"/review/{job_id}/pages/alpha-topic.md/edit", data={"content": edited}
             )
@@ -343,7 +347,7 @@ def test_web_packet_is_saved_then_automatically_processed(tmp_path: Path) -> Non
                 assert proposal is not None
                 assert proposal["packet_id"] is not None
                 review = await client.get("/review")
-                assert f"Packet {proposal['packet_id']}" in review.text
+                assert "Запомни этот связанный фрагмент" in review.text
                 waiting = await client.post(
                     "/packets", data={"user_note": "Этот Packet должен спокойно подождать."}
                 )
@@ -361,7 +365,7 @@ def test_web_packet_is_saved_then_automatically_processed(tmp_path: Path) -> Non
                 statuses = (await client.get("/api/packets")).json()
                 assert sum(item["state"] == "review" for item in statuses) == 2
                 reviews = await client.get("/review")
-                assert all(str(item["id"]) in reviews.text for item in proposals)
+                assert reviews.text.count("Предложение AI") >= 2
 
     asyncio.run(exercise())
 
@@ -402,7 +406,7 @@ def test_web_groups_packet_attempts_and_requeue_is_idempotent(tmp_path: Path) ->
             inbox = (await client.get("/inbox")).text
             assert inbox.count("Повторить анализ") == 1
             assert "Retry job" not in inbox
-            assert "Попытки анализа:" in inbox
+            assert "История обработки:" in inbox
             assert "Не удалось связаться с моделью" in inbox
 
             first = await client.post(f"/packets/{packet['id']}/process")
@@ -454,11 +458,11 @@ def test_web_shows_live_packet_phase_from_persisted_events(tmp_path: Path) -> No
         transport = httpx2.ASGITransport(app=app)
         async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
             inbox = (await client.get("/inbox")).text
-            assert "Codex анализирует материалы" in inbox
+            assert "AI анализирует материалы" in inbox
             statuses = (await client.get("/api/packets")).json()
             status = next(item for item in statuses if item["id"] == packet["id"])
             assert status["state"] == "processing"
-            assert "Codex анализирует материалы" in status["progress"]
+            assert "AI анализирует материалы" in status["progress"]
             assert "прошло" in status["progress"]
 
     asyncio.run(exercise())

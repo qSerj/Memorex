@@ -11,7 +11,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from memorex.config import WikiSettings
-from memorex.wiki_first.models import AgentRunner, RunnerResult
+from memorex.wiki_first.models import AgentRunner, RunnerResult, RunnerSpec
 
 
 class RunnerError(RuntimeError):
@@ -215,6 +215,12 @@ def configured_runner(settings: WikiSettings, name: str) -> CLIAgentRunner:
     if name == "codex":
         return CLIAgentRunner(name, settings.codex_model, settings.codex_reasoning_effort)
     raise ValueError(f"Unsupported Wiki runner: {name}")
+
+
+def configured_profile_runner(spec: RunnerSpec) -> CLIAgentRunner:
+    if spec.runner not in {"claude", "codex"}:
+        raise ValueError(f"Unsupported Wiki runner: {spec.runner}")
+    return CLIAgentRunner(spec.runner, spec.model, spec.effort)
 
 
 def _parse_usage(runner: str, stdout: str) -> dict[str, int | None]:

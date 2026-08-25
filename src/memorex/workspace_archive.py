@@ -88,6 +88,86 @@ def create_workspace_archive(root: Path, destination: Path) -> Path:
     return destination
 
 
+def create_readable_export(root: Path, destination: Path) -> Path:
+    """Export current notes and files without Memorex's databases or runtime metadata."""
+    root = root.expanduser().resolve()
+    destination = destination.expanduser().resolve()
+    if destination == root or destination.is_relative_to(root):
+        raise WorkspaceArchiveError("A readable export must be created outside its workspace")
+    if destination.exists():
+        raise WorkspaceArchiveError(f"Export already exists: {destination}")
+    try:
+        settings = WorkspaceSettings.load(root)
+    except ConfigurationError as exc:
+        raise WorkspaceArchiveError(f"Not a Memorex workspace: {root}") from exc
+    storage = WikiStorage(settings)
+    storage.verify_active()
+    notes = [storage.note(str(item["id"])) for item in storage.notes()]
+    notebooks = storage.notebooks()
+    grouped = {str(item["id"]): [] for item in notebooks}
+    for note in notes:
+        grouped.setdefault(str(note["notebook_id"]), []).append(note)
+
+    lines = [
+        f"# {settings.name}",
+        "",
+        f"Читаемая копия Memorex от {datetime.now(UTC).isoformat()}.",
+        "",
+        "Заметки находятся в `notes/`, исходные материалы — в `sources/`, вложения — в "
+        "`attachments/`. Для чтения Memorex не требуется.",
+    ]
+    for notebook in notebooks:
+        notebook_notes = grouped.get(str(notebook["id"]), [])
+        if not notebook_notes:
+            continue
+        lines.extend(["", f"## {notebook['name']}", ""])
+        for note in sorted(notebook_notes, key=lambda item: str(item["title"]).casefold()):
+            lines.append(f"- [{note['title']}](notes/{note['slug']}.md)")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with ZipFile(
+            destination,
+            mode="x",
+            compression=ZIP_DEFLATED,
+            compresslevel=6,
+            allowZip64=True,
+        ) as archive:
+            archive.writestr("README.md", "\n".join(lines).rstrip() + "\n")
+            for note in notes:
+                attachments = []
+                for attachment in note["attachments"]:
+                    physical_name = f"{attachment['id']}-{attachment['display_name']}"
+                    archive_name = str(
+                        PurePosixPath("attachments", str(note["slug"]), physical_name)
+                    )
+                    archive.write(storage.root / str(attachment["object_path"]), archive_name)
+                    attachments.append((str(attachment["display_name"]), archive_name))
+                text = str(note["text"]).rstrip()
+                if attachments:
+                    text += "\n\n## Приложенные файлы\n\n"
+                    for display_name, archive_name in attachments:
+                        relative = PurePosixPath("..", archive_name)
+                        text += f"- [{display_name}]({relative})\n"
+                archive.writestr(f"notes/{note['slug']}.md", text.rstrip() + "\n")
+            snapshot = storage.snapshot_path(storage.active_snapshot())
+            for source in sorted((snapshot / "sources").rglob("*")):
+                if source.is_file():
+                    relative = source.relative_to(snapshot / "sources")
+                    archive.write(
+                        source,
+                        str(PurePosixPath("sources", *relative.parts)),
+                    )
+        with ZipFile(destination) as archive:
+            broken = archive.testzip()
+        if broken is not None:
+            raise WorkspaceArchiveError(f"Readable export verification failed at {broken}")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
+
+
 def restore_workspace_archive(archive_path: Path, target: Path) -> RestoreResult:
     archive_path = archive_path.expanduser().resolve()
     target = target.expanduser().resolve()

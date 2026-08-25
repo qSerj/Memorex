@@ -1074,8 +1074,8 @@ class WikiStorage:
             connection.execute(
                 "INSERT INTO runner_calls(job_id, purpose, runner, model, command_version, "
                 "prompt_version, duration_ms, status, stdout, stderr, input_tokens, "
-                "output_tokens, cached_input_tokens, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "output_tokens, cached_input_tokens, profile, effort, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     values.get("job_id"),
                     values["purpose"],
@@ -1090,6 +1090,8 @@ class WikiStorage:
                     values.get("input_tokens"),
                     values.get("output_tokens"),
                     values.get("cached_input_tokens"),
+                    values.get("profile"),
+                    values.get("effort"),
                     utc_now(),
                 ),
             )
@@ -2026,6 +2028,9 @@ class WikiStorage:
         for name in ("input_tokens", "output_tokens", "cached_input_tokens"):
             if name not in columns:
                 connection.execute(f"ALTER TABLE runner_calls ADD COLUMN {name} INTEGER")
+        for name in ("profile", "effort"):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE runner_calls ADD COLUMN {name} TEXT")
 
     def _apply_migrations(self, connection: sqlite3.Connection) -> None:
         connection.execute(

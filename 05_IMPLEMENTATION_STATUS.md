@@ -16,7 +16,9 @@ Packet → local save → background analysis → AI proposal → Review → Not
 selected Notes → Discussion → AI answer ──→ optional new Note
 ```
 
-Следующий ещё не реализованный продуктовый слой — минимальные Commitments, после него Attention.
+До 2026-09-15 новые функции заморожены: вместо немедленного перехода к Commitments система
+используется в быту, а наблюдения накапливаются в локальном `USAGE_LOG.md`. Исключения — потеря или
+порча данных, сломанный уже обещанный сценарий и сильный UX-блокер, повторившийся не менее трёх раз.
 
 ## Реализовано
 
@@ -61,6 +63,9 @@ selected Notes → Discussion → AI answer ──→ optional new Note
 - независимый stale proposal rebased на текущую Wiki, конфликтующий возвращается в очередь;
 - natural-language revise и ручной Markdown editor proposal;
 - Claude запускается без глобальных MCP/plugins/hooks/Serena; Codex доступен как runner/fallback.
+- маленький одиночный материал использует Luna/medium, обычная работа — Terra/medium;
+- технический сбой получает одну fallback-попытку через Claude Sonnet/medium;
+- prompt требует сохранять локальную форму существующей Note и вносить минимальную правку.
 
 ### Переносимость и безопасность данных
 
@@ -69,6 +74,7 @@ selected Notes → Discussion → AI answer ──→ optional new Note
 - автоматическая страховочная копия перед полной заменой;
 - snapshots, originals, SQLite, Packets, queue, jobs, discussions и vault переносятся вместе;
 - приложение остаётся loopback-only, однопользовательским и без авторизации.
+- читаемый ZIP экспортирует текущие Notes, Sources и Attachments без SQLite и служебной истории.
 
 ### Сохранённый исследовательский фундамент
 
@@ -80,17 +86,17 @@ overrides и eval. Эти механизмы можно переиспользо
 ## Проверено
 
 - миграции на копии существующего рабочего workspace сохранили прежние Notes и chats;
-- offline suite: 72 tests passed;
+- offline suite: 76 tests passed;
 - Ruff lint и formatting passed;
 - fake runners используются в CI, сеть и credentials для тестов не нужны.
 
 ## Следующий evidence-driven шаг
 
-1. Несколько дней пользоваться заметками, вложениями, поиском и Discussions на реальных материалах.
-2. Записать неудобства интерфейса и только затем править Note UX небольшими итерациями.
-3. Отдельно согласовать минимальную схему Commitments и экран Today.
-4. Реализовать ручные Commitments до автоматического AI extraction.
-5. После проверки Today решать, нужен ли Attention и какой первый канал доставки.
+1. До 2026-09-15 пользоваться заметками, вложениями, поиском и Discussions на реальных материалах.
+2. Записывать в `USAGE_LOG.md` ожидаемое и фактическое поведение, обходной путь и число повторов.
+3. Сразу чинить только три оговорённых класса блокеров.
+4. После периода эксплуатации совместно разобрать журнал и выбрать один следующий эксперимент.
+5. Commitments, URL importer и минимальный `remind_at` конкурируют за этот шаг на основании фактов.
 
 ## Сознательно не реализовано
 

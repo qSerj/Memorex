@@ -31,6 +31,13 @@ class WorkspaceConfig:
 
 
 @dataclass(frozen=True)
+class ModelProfileSettings:
+    runner: str
+    model: str
+    effort: str
+
+
+@dataclass(frozen=True)
 class WikiSettings:
     ingest_runner: str = "claude"
     query_runner: str = "codex"
@@ -38,6 +45,11 @@ class WikiSettings:
     claude_effort: str = "max"
     codex_model: str = "gpt-5.6-sol"
     codex_reasoning_effort: str = "max"
+    simple_profile: ModelProfileSettings = ModelProfileSettings("codex", "gpt-5.6-luna", "medium")
+    standard_profile: ModelProfileSettings = ModelProfileSettings(
+        "codex", "gpt-5.6-terra", "medium"
+    )
+    fallback_profile: ModelProfileSettings = ModelProfileSettings("claude", "sonnet", "medium")
 
 
 @dataclass(frozen=True)
@@ -82,7 +94,13 @@ class WorkspaceSettings:
                 'claude_model = "opus"\n'
                 'claude_effort = "max"\n'
                 'codex_model = "gpt-5.6-sol"\n'
-                'codex_reasoning_effort = "max"\n',
+                'codex_reasoning_effort = "max"\n\n'
+                "[wiki.profiles.simple]\n"
+                'runner = "codex"\nmodel = "gpt-5.6-luna"\neffort = "medium"\n\n'
+                "[wiki.profiles.standard]\n"
+                'runner = "codex"\nmodel = "gpt-5.6-terra"\neffort = "medium"\n\n'
+                "[wiki.profiles.fallback]\n"
+                'runner = "claude"\nmodel = "sonnet"\neffort = "medium"\n',
                 encoding="utf-8",
             )
         return cls.load(resolved)
@@ -111,6 +129,7 @@ class WorkspaceSettings:
         raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
         models = raw.get("models", {})
         wiki = raw.get("wiki", {})
+        profiles = wiki.get("profiles", {})
         return cls(
             root=resolved,
             name=str(raw.get("name") or resolved.name),
@@ -125,6 +144,15 @@ class WorkspaceSettings:
                 claude_effort=str(wiki.get("claude_effort") or "max"),
                 codex_model=str(wiki.get("codex_model") or "gpt-5.6-sol"),
                 codex_reasoning_effort=str(wiki.get("codex_reasoning_effort") or "max"),
+                simple_profile=_model_profile(
+                    profiles.get("simple"), "codex", "gpt-5.6-luna", "medium"
+                ),
+                standard_profile=_model_profile(
+                    profiles.get("standard"), "codex", "gpt-5.6-terra", "medium"
+                ),
+                fallback_profile=_model_profile(
+                    profiles.get("fallback"), "claude", "sonnet", "medium"
+                ),
             ),
         )
 
@@ -138,7 +166,30 @@ def _render_wiki_settings(settings: WikiSettings) -> str:
         f"claude_effort = {json.dumps(settings.claude_effort)}\n"
         f"codex_model = {json.dumps(settings.codex_model)}\n"
         "codex_reasoning_effort = "
-        f"{json.dumps(settings.codex_reasoning_effort)}\n"
+        f"{json.dumps(settings.codex_reasoning_effort)}\n\n"
+        f"{_render_profile('simple', settings.simple_profile)}\n"
+        f"{_render_profile('standard', settings.standard_profile)}\n"
+        f"{_render_profile('fallback', settings.fallback_profile)}"
+    )
+
+
+def _model_profile(
+    raw: object, default_runner: str, default_model: str, default_effort: str
+) -> ModelProfileSettings:
+    values = raw if isinstance(raw, dict) else {}
+    return ModelProfileSettings(
+        runner=str(values.get("runner") or default_runner),
+        model=str(values.get("model") or default_model),
+        effort=str(values.get("effort") or default_effort),
+    )
+
+
+def _render_profile(name: str, profile: ModelProfileSettings) -> str:
+    return (
+        f"[wiki.profiles.{name}]\n"
+        f"runner = {json.dumps(profile.runner)}\n"
+        f"model = {json.dumps(profile.model)}\n"
+        f"effort = {json.dumps(profile.effort)}\n"
     )
 
 

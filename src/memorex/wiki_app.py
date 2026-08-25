@@ -40,6 +40,7 @@ from memorex.wiki_first.service import (
 )
 from memorex.workspace_archive import (
     WorkspaceArchiveError,
+    create_readable_export,
     create_workspace_archive,
     restore_workspace_archive,
 )
@@ -311,7 +312,10 @@ def create_app(
                 notes=svc.storage.notes(),
                 notebooks=svc.storage.notebooks(),
                 jobs=svc.storage.jobs(include_packets=False),
-                history=svc.history(),
+                history=[
+                    {**item, "label": _history_label(str(item.get("reason") or ""))}
+                    for item in svc.history()
+                ],
                 chats=svc.storage.chat_sessions(),
                 proposal=svc.storage.latest_proposal(),
                 proposals=svc.storage.proposals(),
@@ -389,6 +393,38 @@ def create_app(
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", settings.root.name).strip("-")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"{safe_name or 'memorex'}-{timestamp}.memorex.zip"
+        try:
+            content = temporary.read_bytes()
+        finally:
+            temporary.unlink(missing_ok=True)
+        return Response(
+            content=content,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.post("/workspace/export-readable")
+    async def export_readable_workspace() -> Response:
+        settings: WorkspaceSettings = state["settings"]
+        if settings is None:
+            raise HTTPException(409, "Choose a workspace first")
+        tasks: WorkspaceTasks = state["tasks"]
+        if not tasks.pause_for_maintenance():
+            raise HTTPException(409, "Wait for the current analysis or query to finish")
+        handle, temporary_name = tempfile.mkstemp(prefix="memorex-readable-", suffix=".zip")
+        os.close(handle)
+        temporary = Path(temporary_name)
+        temporary.unlink()
+        try:
+            create_readable_export(settings.root, temporary)
+        except (OSError, sqlite3.Error, WorkspaceArchiveError, ValueError) as exc:
+            temporary.unlink(missing_ok=True)
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            tasks.resume_after_maintenance()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", settings.root.name).strip("-")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{safe_name or 'memorex'}-{timestamp}.readable.zip"
         try:
             content = temporary.read_bytes()
         finally:
@@ -1141,6 +1177,15 @@ def _decorate_packet(packet: dict[str, Any]) -> dict[str, Any]:
             **item,
             "is_image": str(item.get("mime_type") or "").startswith("image/"),
             "content_url": f"/packets/{packet['id']}/items/{item['id']}",
+            "kind_label": {"file": "файл", "image": "изображение", "url": "ссылка"}.get(
+                str(item.get("kind")), "материал"
+            ),
+            "status_label": {
+                "ready": "готово",
+                "waiting_importer": "сохранено",
+                "stored": "сохранено",
+                "applied": "добавлено в память",
+            }.get(str(item.get("status")), str(item.get("status"))),
             "mode_label": (
                 "ожидает импортера"
                 if item.get("kind") == "url"
@@ -1183,26 +1228,19 @@ def _packet_progress(packet: dict[str, Any]) -> str:
 
     latest = packet.get("latest_job") or {}
     event = packet.get("latest_event") or {}
-    payload = event.get("payload") or {}
     phase = str(event.get("phase") or "")
-    runner = str(payload.get("runner") or latest.get("runner") or "").capitalize()
     if phase == "retrieval":
-        message = "Подбираем связанные страницы Wiki"
+        message = "Подбираем связанные заметки"
     elif phase == "runner":
-        message = f"{runner} запускается" if runner else "Запускаем модель"
+        message = "Запускаем AI"
     elif phase == "model-started":
-        message = f"{runner} начал анализ" if runner else "Модель начала анализ"
+        message = "AI начал анализ"
     elif phase == "model-working":
-        message = f"{runner} анализирует материалы" if runner else "Модель анализирует материалы"
+        message = "AI анализирует материалы"
     elif phase == "model-completed":
-        message = (
-            f"{runner} закончил анализ; проверяем результат"
-            if runner
-            else "Модель закончила анализ; проверяем результат"
-        )
+        message = "AI закончил анализ; проверяем результат"
     elif phase == "fallback":
-        fallback = str(payload.get("fallback") or "запасную модель").capitalize()
-        message = f"Первый анализ не завершён; пробуем {fallback}"
+        message = "Первый анализ не завершён; пробуем ещё раз"
     else:
         message = "Готовим материалы к анализу"
     started_at = latest.get("created_at") or queue.get("updated_at")
@@ -1247,14 +1285,29 @@ def _friendly_packet_error(error: str) -> str:
     if "revised proposal is invalid" in lowered:
         return "Корректировка не прошла проверку. Предыдущий результат сохранён в Review."
     if "file exists" in lowered and "-merged" in lowered:
-        return "Внутренняя ошибка сборки результата. Packet сохранён и его можно повторить."
+        return "Внутренняя ошибка сборки результата. Материал сохранён; анализ можно повторить."
     if "interrupted" in lowered:
-        return "Анализ был прерван. Packet сохранён и вернётся в очередь."
+        return "Анализ был прерван. Материал сохранён и вернётся в очередь."
     if "timed out" in lowered or "timeout" in lowered:
         return "Модель не ответила вовремя. Memorex повторит анализ автоматически."
     if any(marker in lowered for marker in ("connection", "network", "transport", "http/request")):
         return "Не удалось связаться с моделью. Memorex повторит анализ автоматически."
     return error
+
+
+def _history_label(reason: str) -> str:
+    if reason == "initialize":
+        return "Создана память"
+    prefixes = {
+        "manual-create:": "Создана заметка",
+        "manual-edit:": "Заметка отредактирована",
+        "apply:": "Приняты изменения AI",
+        "rollback:": "Восстановлена предыдущая версия",
+    }
+    return next(
+        (label for prefix, label in prefixes.items() if reason.startswith(prefix)),
+        "Память обновлена",
+    )
 
 
 def render_markdown(text: str, *, source_job: str | None = None) -> str:
