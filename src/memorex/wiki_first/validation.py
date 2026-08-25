@@ -12,6 +12,7 @@ LINE_LOCATOR = re.compile(r"строк(?:а|и)?\s+(\d+)(?:[–-](\d+))?", re.IG
 REFERENCE_SOURCE = re.compile(r"^\s*(?:-\s*)?\[([A-Z]\d+)\]:\s+(\.\./sources/\S+)")
 HASH_LINE_LOCATOR = re.compile(r"#L(\d+)(?:-L?(\d+))?")
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.md")
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def validate_wiki(
@@ -37,7 +38,6 @@ def validate_wiki(
         if not lines or not lines[0].startswith("# "):
             errors.append(f"{path.name}: first line must be an H1 title")
         if "## Источники" not in text:
-            errors.append(f"{path.name}: must end with an Источники section")
             body, source_block = text, ""
         else:
             body, source_block = text.rsplit("## Источники", 1)
@@ -48,6 +48,8 @@ def validate_wiki(
                 errors.append(f"{path.name}: unresolved Wiki link [[{target}]]")
         used = set(CITATION.findall(body))
         defined = set(CITATION.findall(source_block))
+        if used and not source_block:
+            errors.append(f"{path.name}: citations require an Источники section")
         if missing := sorted(used - defined):
             errors.append(f"{path.name}: undefined citations: {', '.join(missing)}")
         if unused := sorted(defined - used):
@@ -74,8 +76,18 @@ def validate_wiki(
             if not target.is_file():
                 errors.append(f"{path.name}: missing source file: {relative}")
                 continue
-            source_lines = len(target.read_text(encoding="utf-8").splitlines())
             locators = LINE_LOCATOR.findall(source_line) + HASH_LINE_LOCATOR.findall(relative)
+            if target.suffix.lower() in IMAGE_SUFFIXES:
+                if locators:
+                    errors.append(
+                        f"{path.name}: image source cannot use a line locator: {relative}"
+                    )
+                continue
+            try:
+                source_lines = len(target.read_text(encoding="utf-8").splitlines())
+            except UnicodeDecodeError:
+                errors.append(f"{path.name}: unsupported binary source: {relative}")
+                continue
             for start, end in locators:
                 last = int(end or start)
                 if last > source_lines:

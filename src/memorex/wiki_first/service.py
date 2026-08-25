@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from pydantic import ValidationError
 
 from memorex.config import WorkspaceSettings
-from memorex.wiki_first.models import AgentRunner, ProposalActions, RunnerResult
+from memorex.wiki_first.models import AgentRunner, PacketUpload, ProposalActions, RunnerResult
 from memorex.wiki_first.prompts import (
     INGEST_PROMPT_VERSION,
     QUERY_PROMPT_VERSION,
@@ -42,6 +42,7 @@ class WikiFirstProcessingError(WikiFirstError):
 RunnerResolver = Callable[[str], AgentRunner]
 ProgressCallback = Callable[[dict[str, object]], None]
 SOURCE_REF = re.compile(r"\.\./sources/([^\s)#]+)")
+WIKI_LINK = re.compile(r"\[\[([a-z0-9][a-z0-9-]*)\]\]")
 WORD = re.compile(r"[^\W_]{4,}", re.UNICODE)
 SAFE_PAGE = re.compile(r"(?:README|[a-z0-9]+(?:-[a-z0-9]+)*)\.md")
 
@@ -79,6 +80,96 @@ class WikiFirstService:
     def initialize(self) -> dict[str, object]:
         return self.storage.initialize()
 
+    def create_note(self, title: str, body: str, notebook_id: str) -> dict[str, object]:
+        clean_title = _validate_note_title(title)
+        self.storage.initialize()
+        note_id = uuid.uuid4().hex[:12]
+        slug = f"note-{note_id}"
+        return self._save_note_snapshot(
+            note_id=note_id,
+            slug=slug,
+            title=clean_title,
+            body=body,
+            sources="",
+            notebook_id=notebook_id,
+            expected_snapshot_id=str(self.storage.active_snapshot()["id"]),
+            new_note=True,
+        )
+
+    def edit_note(
+        self,
+        note_id: str,
+        *,
+        title: str,
+        body: str,
+        notebook_id: str,
+        expected_snapshot_id: str,
+    ) -> dict[str, object]:
+        clean_title = _validate_note_title(title)
+        note = self.storage.note(note_id)
+        _old_title, _old_body, sources = split_note_markdown(str(note["text"]))
+        return self._save_note_snapshot(
+            note_id=note_id,
+            slug=str(note["slug"]),
+            title=clean_title,
+            body=body,
+            sources=sources,
+            notebook_id=notebook_id,
+            expected_snapshot_id=expected_snapshot_id,
+            new_note=False,
+        )
+
+    def _save_note_snapshot(
+        self,
+        *,
+        note_id: str,
+        slug: str,
+        title: str,
+        body: str,
+        sources: str,
+        notebook_id: str,
+        expected_snapshot_id: str,
+        new_note: bool,
+    ) -> dict[str, object]:
+        self.storage.verify_active()
+        active = self.storage.active_snapshot()
+        if str(active["id"]) != expected_snapshot_id:
+            raise WikiFirstError("The memory changed while this note was being edited")
+        snapshot_id = uuid.uuid4().hex[:12]
+        target = self.storage.snapshots_dir / snapshot_id
+        text = compose_note_markdown(title, body, sources)
+        shutil.copytree(self.storage.snapshot_path(active), target)
+        _make_writable(target)
+        (target / "wiki" / f"{slug}.md").write_text(text, encoding="utf-8")
+        validation = validate_wiki(target / "wiki", target / "sources")
+        if not validation.valid:
+            shutil.rmtree(target)
+            raise WikiFirstError("Invalid note: " + "; ".join(validation.errors))
+        tree_hash = hash_tree(target)
+        _make_read_only(target)
+        try:
+            self.storage.activate_manual_note(
+                expected_snapshot_id=expected_snapshot_id,
+                snapshot_id=snapshot_id,
+                relative_path=str(target.relative_to(self.storage.root)),
+                tree_hash=tree_hash,
+                note_id=note_id,
+                slug=slug,
+                notebook_id=notebook_id,
+                new_note=new_note,
+            )
+        except ValueError as exc:
+            _make_writable(target)
+            shutil.rmtree(target)
+            raise WikiFirstError(str(exc)) from exc
+        self.storage.rebuild_fts()
+        self.storage.sync_vault()
+        return self.storage.note(note_id)
+
+    def search_notes(self, query: str) -> list[dict[str, object]]:
+        self.storage.initialize()
+        return self.storage.search_notes(query)
+
     def scan(self) -> list[dict[str, object]]:
         self.storage.initialize()
         return [
@@ -114,15 +205,18 @@ class WikiFirstService:
         self,
         *,
         user_note: str,
-        files: list[tuple[str, str | None, bytes]],
+        files: list[PacketUpload | tuple[str, str | None, bytes]],
         urls: list[str],
     ) -> dict[str, object]:
         self.storage.initialize()
         cleaned_urls = [_validate_packet_url(url) for url in urls if url.strip()]
         try:
+            uploads = [
+                item if isinstance(item, PacketUpload) else PacketUpload(*item) for item in files
+            ]
             return self.storage.create_packet(
                 user_note=user_note,
-                files=files,
+                files=uploads,
                 urls=cleaned_urls,
             )
         except ValueError as exc:
@@ -156,8 +250,6 @@ class WikiFirstService:
         if not pending:
             status = "waiting_importer" if packet["waiting_importer_count"] else "unchanged"
             return {"status": status, "packet_id": packet_id, "pending_sources": 0}
-        if self.storage.status()["proposal"] is not None:
-            raise WikiFirstError("Finish or reject the current proposal before processing Packet")
         try:
             if not queue_claimed:
                 self.storage.begin_packet_attempt(packet_id)
@@ -296,6 +388,7 @@ class WikiFirstService:
         if not feedback.strip():
             raise WikiFirstError("Revision feedback must not be empty")
         proposal = self.storage.proposal(job_id)
+        self._job_id = job_id
         if proposal["status"] != "proposed":
             raise WikiFirstError(f"Proposal {job_id} is not awaiting review")
         if runner_name is not None:
@@ -329,31 +422,73 @@ class WikiFirstService:
                 "revise",
                 REVISE_PROMPT_VERSION,
             )
-        except Exception:
-            self.storage.set_job_status(job_id, "proposed")
+            self._merge_stage(old, stage)
+            validation = self._validate_stage(stage, proposal)
+            if not validation["valid"]:
+                raise WikiFirstError(
+                    "Revised proposal is invalid: " + "; ".join(validation["errors"])
+                )
+            self.storage.add_proposal_revision(
+                job_id,
+                revision_no=revision,
+                relative_path=str(stage.relative_to(self.storage.root)),
+                tree_hash=hash_tree(stage),
+                validation_json=json.dumps(validation, ensure_ascii=False),
+                feedback=feedback,
+                retrieval_json=json.dumps(retrieval, ensure_ascii=False),
+            )
+        except Exception as exc:
+            self.storage.restore_proposal_after_failed_revision(job_id, str(exc))
             raise
-        self._merge_stage(old, stage)
+        return self._proposal_result(job_id, result)
+
+    def edit_proposal_page(self, job_id: str, page_name: str, content: str) -> dict[str, object]:
+        """Create a proposal revision from a literal Markdown edit, without calling a model."""
+        if len(content.encode("utf-8")) > 1024 * 1024:
+            raise WikiFirstError("Wiki page is larger than 1 MiB")
+        name = _safe_page(page_name)
+        proposal = self.storage.proposal(job_id)
+        if proposal["status"] != "proposed":
+            raise WikiFirstError(f"Proposal {job_id} is not awaiting review")
+        old = self.storage.root / str(proposal["relative_path"])
+        if not (old / "wiki" / name).is_file():
+            raise WikiFirstError(f"Proposal page does not exist: {name}")
+        revision = int(proposal["revision_no"]) + 1
+        stage = self.storage.jobs_dir / job_id / f"rev-{revision}-manual"
+        if stage.exists():
+            _make_writable(stage)
+            shutil.rmtree(stage)
+        shutil.copytree(old, stage)
+        _make_writable(stage)
+        (stage / "wiki" / name).write_text(content, encoding="utf-8")
         validation = self._validate_stage(stage, proposal)
         if not validation["valid"]:
-            raise WikiFirstError("Revised proposal is invalid: " + "; ".join(validation["errors"]))
+            shutil.rmtree(stage)
+            raise WikiFirstError("Manual edit is invalid: " + "; ".join(validation["errors"]))
         self.storage.add_proposal_revision(
             job_id,
             revision_no=revision,
             relative_path=str(stage.relative_to(self.storage.root)),
             tree_hash=hash_tree(stage),
             validation_json=json.dumps(validation, ensure_ascii=False),
-            feedback=feedback,
-            retrieval_json=json.dumps(retrieval, ensure_ascii=False),
+            feedback=f"Literal manual edit: {name}",
+            retrieval_json=str(proposal.get("retrieval_json") or "{}"),
         )
-        return self._proposal_result(job_id, result)
+        return self.review(job_id)
 
     def apply(self, job_id: str) -> dict[str, object]:
         self.storage.verify_active()
         proposal = self.storage.proposal(job_id)
         if proposal["status"] != "proposed":
             raise WikiFirstError(f"Proposal {job_id} is not awaiting review")
-        stage = self.storage.root / str(proposal["relative_path"])
-        validation = self._validate_stage(stage, proposal)
+        prepared = self._prepare_proposal_for_apply(proposal)
+        if prepared is None:
+            return {
+                "status": "requeued",
+                "job_id": job_id,
+                "message": "Wiki changed on the same pages; Packet was requeued",
+            }
+        proposal, stage, validation = prepared
         if not validation["valid"]:
             raise WikiFirstError("Proposal is invalid: " + "; ".join(validation["errors"]))
         snapshot_id = uuid.uuid4().hex[:12]
@@ -365,6 +500,7 @@ class WikiFirstService:
         self.storage.activate(
             job_id, snapshot_id, str(target.relative_to(self.storage.root)), hash_tree(target)
         )
+        self.storage.reconcile_notes()
         self.storage.rebuild_fts()
         vault = self.storage.sync_vault()
         return {
@@ -376,6 +512,74 @@ class WikiFirstService:
             "validation": validation,
         }
 
+    def _prepare_proposal_for_apply(
+        self, proposal: dict[str, object]
+    ) -> tuple[dict[str, object], Path, dict[str, object]] | None:
+        stage = self.storage.root / str(proposal["relative_path"])
+        active = self.storage.active_snapshot()
+        if str(active["id"]) == str(proposal["base_snapshot_id"]):
+            return proposal, stage, self._validate_stage(stage, proposal)
+
+        base = self.storage.snapshot_path(self._snapshot(str(proposal["base_snapshot_id"])))
+        current = self.storage.snapshot_path(active)
+        proposed_pages = set(changed_pages(base / "wiki", stage / "wiki"))
+        active_pages = set(changed_pages(base / "wiki", current / "wiki"))
+        conflicts = sorted((proposed_pages & active_pages) - {"README.md"})
+        if conflicts:
+            self._requeue_stale_packet(proposal, conflicts)
+            return None
+
+        revision = int(proposal["revision_no"]) + 1
+        rebased = self.storage.jobs_dir / str(proposal["id"]) / f"rev-{revision}-rebase"
+        if rebased.exists():
+            _make_writable(rebased)
+            shutil.rmtree(rebased)
+        shutil.copytree(current, rebased)
+        _make_writable(rebased)
+        for name in sorted(proposed_pages - {"README.md"}):
+            authored = stage / "wiki" / name
+            target = rebased / "wiki" / name
+            if authored.is_file():
+                shutil.copy2(authored, target)
+            elif target.exists():
+                target.unlink()
+        _merge_readme_navigation(
+            base / "wiki" / "README.md",
+            current / "wiki" / "README.md",
+            stage / "wiki" / "README.md",
+            rebased / "wiki" / "README.md",
+        )
+        for source in (stage / "sources").glob("*"):
+            if source.is_file():
+                shutil.copy2(source, rebased / "sources" / source.name)
+        for extra in ("proposal-report.md", "proposal-actions.json"):
+            if (stage / extra).is_file():
+                shutil.copy2(stage / extra, rebased / extra)
+        rebased_proposal = {**proposal, "base_snapshot_id": active["id"]}
+        validation = self._validate_stage(rebased, rebased_proposal)
+        if not validation["valid"]:
+            self._requeue_stale_packet(proposal, validation["errors"])
+            return None
+        self.storage.add_proposal_revision(
+            str(proposal["id"]),
+            revision_no=revision,
+            relative_path=str(rebased.relative_to(self.storage.root)),
+            tree_hash=hash_tree(rebased),
+            validation_json=json.dumps(validation, ensure_ascii=False),
+            feedback="deterministic rebase onto current Wiki",
+            retrieval_json=str(proposal.get("retrieval_json") or "{}"),
+            base_snapshot_id=str(active["id"]),
+        )
+        refreshed = self.storage.proposal(str(proposal["id"]))
+        return refreshed, rebased, validation
+
+    def _requeue_stale_packet(self, proposal: dict[str, object], details: list[object]) -> None:
+        reason = "Wiki changed while awaiting Review: " + ", ".join(map(str, details))
+        try:
+            self.storage.requeue_stale_proposal(str(proposal["id"]), reason)
+        except ValueError as exc:
+            raise WikiFirstError(reason) from exc
+
     def reject(self, job_id: str, reason: str) -> dict[str, object]:
         self.storage.reject(job_id, reason.strip() or "rejected by administrator")
         return {"status": "rejected", "job_id": job_id, "reason": reason}
@@ -384,13 +588,18 @@ class WikiFirstService:
         job = self.storage.get_job(job_id)
         if job["status"] not in {"failed", "interrupted", "cancelled", "rejected"}:
             raise WikiFirstError("Job is not retryable")
-        pending = [self.storage.source_revision(item) for item in job["source_revision_ids"]]
+        packet_id = str(job["packet_id"]) if job.get("packet_id") else None
+        pending = (
+            self.storage.packet_source_revisions(packet_id)
+            if packet_id
+            else [self.storage.source_revision(item) for item in job["source_revision_ids"]]
+        )
         return self._create_proposal(
             str(job["kind"]),
             pending,
             str(job["runner"]),
             job.get("user_input"),
-            packet_id=str(job["packet_id"]) if job.get("packet_id") else None,
+            packet_id=packet_id,
         )
 
     def ask(
@@ -474,6 +683,80 @@ class WikiFirstService:
             "selected_pages": selected,
         }
 
+    def answer_discussion_turn(
+        self, turn_id: str, *, runner_name: str | None = None
+    ) -> dict[str, object]:
+        runner_name = runner_name or self.settings.wiki.query_runner
+        _validate_runner_name(runner_name)
+        turn = self.storage.discussion_turn(turn_id)
+        snapshot = self._snapshot(str(turn["snapshot_id"]))
+        note_ids = list(turn["note_ids"])
+        if not note_ids:
+            raise WikiFirstError("Discussion has no selected notes")
+        notes = [self.storage.note(note_id) for note_id in note_ids]
+        selected = [str(note["slug"]) for note in notes]
+        source = self.storage.snapshot_path(snapshot)
+        workdir = self.storage.answers_dir / uuid.uuid4().hex[:12]
+        self._prepare_subset(workdir, source, selected, [])
+        _make_writable(workdir / "sources")
+        images: list[Path] = []
+        attachment_lines = []
+        for note in notes:
+            for attachment in note["attachments"]:
+                safe_name = _safe_attachment_name(str(attachment["display_name"]))
+                name = f"a{attachment['id']}-{safe_name}"
+                target = workdir / "sources" / name
+                shutil.copy2(self.storage.root / str(attachment["object_path"]), target)
+                attachment_lines.append(f"- sources/{name} ({attachment['mime_type']})")
+                if str(attachment["mime_type"]).startswith("image/"):
+                    images.append(target)
+        _make_read_only(workdir / "wiki")
+        _make_read_only(workdir / "sources")
+        history = self.storage.chat_messages(str(turn["session_id"]), 10)
+        attachment_context = (
+            "\nATTACHMENTS BELONGING TO THE SELECTED NOTES:\n" + "\n".join(attachment_lines)
+            if attachment_lines
+            else ""
+        )
+        self._emit(
+            "retrieval",
+            **self._retrieval(selected, source / "wiki"),
+        )
+        result = self._run_and_log(
+            self._runner_resolver(runner_name),
+            workdir,
+            query_prompt(
+                str(turn["question"]),
+                context=_chat_context(history[:-1]) + attachment_context,
+            ),
+            True,
+            None,
+            "query",
+            QUERY_PROMPT_VERSION,
+            images=images,
+        )
+        answer_path = workdir / "answer.md"
+        if not answer_path.is_file() or not answer_path.read_text(encoding="utf-8").strip():
+            raise WikiFirstError("Query runner did not create answer.md")
+        answer = answer_path.read_text(encoding="utf-8").strip()
+        answer_id = self.storage.finish_discussion_turn(
+            turn_id, answer, runner=result.runner, model=result.model
+        )
+        self.storage.record_answer(
+            snapshot_id=str(snapshot["id"]),
+            question=str(turn["question"]),
+            answer=answer,
+            runner=result.runner,
+            model=result.model,
+        )
+        return {
+            "status": "succeeded",
+            "turn_id": turn_id,
+            "answer_message_id": answer_id,
+            "session_id": turn["session_id"],
+            "selected_pages": selected,
+        }
+
     def validate(self, job_id: str | None = None) -> dict[str, object]:
         self.storage.initialize()
         if job_id:
@@ -492,6 +775,7 @@ class WikiFirstService:
     def rollback(self, snapshot_id: str) -> dict[str, object]:
         self.storage.initialize()
         self.storage.rollback(snapshot_id)
+        self.storage.reconcile_notes()
         self.storage.rebuild_fts()
         vault = self.storage.sync_vault()
         snapshot = self.storage.active_snapshot()
@@ -551,9 +835,22 @@ class WikiFirstService:
         self._emit("retrieval", sources=len(pending), **retrieval)
         stage = self.storage.jobs_dir / job_id / "rev-1"
         names = self._prepare_subset(stage, base, selected, pending)
+        source_items = [
+            {
+                "name": name,
+                "kind": str(item["kind"]),
+                "instruction": str(item.get("analysis_instruction") or ""),
+            }
+            for name, item in zip(names, pending, strict=True)
+        ]
+        images = [
+            stage / "sources" / descriptor["name"]
+            for descriptor in source_items
+            if descriptor["kind"] == "image"
+        ]
         prompt = ingest_prompt(
             language=self.settings.language,
-            source_names=names,
+            source_items=source_items,
             existing=str(job["base_snapshot_id"]) != "initial",
             selected_pages=selected,
             packet=packet_id is not None,
@@ -577,6 +874,7 @@ class WikiFirstService:
                     job_id,
                     "ingest",
                     INGEST_PROMPT_VERSION,
+                    images=images,
                 )
                 self._merge_stage(base, stage)
                 validation = self._validate_stage(stage, job)
@@ -634,6 +932,9 @@ class WikiFirstService:
         chunks = []
         for item in pending:
             chunks.append(Path(str(item["canonical_path"])).stem.replace("-", " "))
+            if item["kind"] == "image":
+                chunks.extend(WORD.findall(str(item.get("analysis_instruction") or "").lower()))
+                continue
             text = (self.storage.root / str(item["normalized_path"])).read_text(encoding="utf-8")
             chunks += [line.lstrip("# ") for line in text.splitlines() if line.startswith("#")]
             chunks += [word for word, _ in Counter(WORD.findall(text.lower())).most_common(20)]
@@ -669,7 +970,10 @@ class WikiFirstService:
         for item in pending:
             name = f"r{item['id']}-{_safe_source_name(Path(str(item['canonical_path'])).name)}"
             names.append(name)
-            shutil.copy2(self.storage.root / str(item["normalized_path"]), stage / "sources" / name)
+            source_path = (
+                item["object_path"] if item["kind"] == "image" else item["normalized_path"]
+            )
+            shutil.copy2(self.storage.root / str(source_path), stage / "sources" / name)
         _make_writable(stage / "wiki")
         _make_read_only(stage / "sources")
         return names
@@ -743,6 +1047,14 @@ class WikiFirstService:
     def _validate_stage(self, stage: Path, proposal: dict[str, object]) -> dict[str, object]:
         base = self.storage.snapshot_path(self._snapshot(str(proposal["base_snapshot_id"])))
         result = validate_wiki(stage / "wiki", stage / "sources", base / "wiki")
+        for name in changed_pages(base / "wiki", stage / "wiki"):
+            page = stage / "wiki" / name
+            if (
+                name != "README.md"
+                and page.is_file()
+                and "## Источники" not in page.read_text(encoding="utf-8")
+            ):
+                result.errors.append(f"{name}: model-authored pages require an Источники section")
         if not (stage / "proposal-report.md").is_file():
             result.errors.append("proposal-report.md is required")
         return result.as_dict()
@@ -756,6 +1068,7 @@ class WikiFirstService:
         job_id: str | None,
         purpose: str,
         prompt_version: str,
+        images: list[Path] | None = None,
     ) -> RunnerResult:
         self._emit("runner", runner=runner.name, model=runner.model)
         try:
@@ -763,6 +1076,7 @@ class WikiFirstService:
                 workdir,
                 prompt,
                 writable=writable,
+                images=images,
                 progress=lambda e: self._emit(
                     str(e.get("phase", "runner")), **{k: v for k, v in e.items() if k != "phase"}
                 ),
@@ -837,6 +1151,50 @@ def _chat_context(messages: list[dict[str, object]]) -> str:
     return "\n".join(f"{x['role']}: {x['content']}" for x in messages[-10:])[-16000:]
 
 
+def split_note_markdown(text: str) -> tuple[str, str, str]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    title = lines[0][2:].strip() if lines and lines[0].startswith("# ") else "Без названия"
+    remainder = "\n".join(lines[1:]).strip()
+    marker = "## Источники"
+    if marker in remainder:
+        body, sources = remainder.rsplit(marker, 1)
+        return title, body.strip(), marker + sources.rstrip() + "\n"
+    return title, remainder, ""
+
+
+def compose_note_markdown(title: str, body: str, sources: str) -> str:
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(normalized.encode("utf-8")) > 1024 * 1024:
+        raise WikiFirstError("Note text is larger than 1 MiB")
+    parts = [f"# {title}"]
+    if normalized:
+        parts.append(normalized)
+    if sources.strip():
+        parts.append(sources.strip())
+    return "\n\n".join(parts).rstrip() + "\n"
+
+
+def _validate_note_title(title: str) -> str:
+    clean = " ".join(title.split())
+    if not clean or len(clean) > 200:
+        raise WikiFirstError("Note title must contain 1-200 characters")
+    return clean
+
+
+def _merge_readme_navigation(base: Path, current: Path, proposed: Path, target: Path) -> None:
+    current_text = current.read_text(encoding="utf-8")
+    base_links = set(WIKI_LINK.findall(base.read_text(encoding="utf-8")))
+    current_links = set(WIKI_LINK.findall(current_text))
+    proposed_links = set(WIKI_LINK.findall(proposed.read_text(encoding="utf-8")))
+    additions = sorted(proposed_links - base_links - current_links)
+    if additions:
+        current_text = (
+            current_text.rstrip() + "\n\n" + "\n".join(f"- [[{slug}]]" for slug in additions)
+        )
+        current_text += "\n"
+    target.write_text(current_text, encoding="utf-8")
+
+
 def _safe_page(value: str) -> str:
     normalized = value.removeprefix("wiki/")
     name = Path(normalized).name
@@ -883,7 +1241,14 @@ def changed_pages(before: Path, after: Path) -> list[str]:
 def _safe_source_name(name: str) -> str:
     suffix = Path(name).suffix.lower()
     stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", Path(name).stem).strip("-.") or "source"
-    return f"{stem}{suffix if suffix in {'.md', '.txt'} else '.txt'}"
+    allowed = {".jpeg", ".jpg", ".md", ".png", ".txt", ".webp"}
+    return f"{stem}{suffix if suffix in allowed else '.txt'}"
+
+
+def _safe_attachment_name(name: str) -> str:
+    suffix = re.sub(r"[^a-zA-Z0-9.]", "", Path(name).suffix.lower())[:16]
+    stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", Path(name).stem).strip("-.") or "attachment"
+    return f"{stem[:80]}{suffix}"
 
 
 def _validate_runner_name(name: str) -> None:

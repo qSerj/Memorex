@@ -23,6 +23,15 @@ class RunnerResult:
 
 
 @dataclass(frozen=True)
+class PacketUpload:
+    name: str
+    mime_type: str | None
+    data: bytes
+    processing_mode: Literal["analyze", "store"] = "analyze"
+    analysis_instruction: str = ""
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -47,7 +56,14 @@ class AgentRunner:
     name: str
     model: str
 
-    def run(self, workdir: Path, prompt: str, *, writable: bool) -> RunnerResult:
+    def run(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        writable: bool,
+        images: list[Path] | None = None,
+    ) -> RunnerResult:
         raise NotImplementedError
 
     def run_with_progress(
@@ -56,6 +72,7 @@ class AgentRunner:
         prompt: str,
         *,
         writable: bool,
+        images: list[Path] | None = None,
         progress: Callable[[dict[str, object]], None] | None = None,
         cancel_event: Event | None = None,
     ) -> RunnerResult:

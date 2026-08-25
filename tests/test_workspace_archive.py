@@ -7,6 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 from memorex.config import WorkspaceSettings
+from memorex.wiki_first.models import PacketUpload
 from memorex.wiki_first.service import WikiFirstService
 from memorex.wiki_first.storage import WikiStorage
 from memorex.workspace_archive import (
@@ -15,14 +16,26 @@ from memorex.workspace_archive import (
     restore_workspace_archive,
 )
 
+PNG = b"\x89PNG\r\n\x1a\nportable-image"
+
 
 def test_full_workspace_restore_preserves_previous_workspace_as_backup(tmp_path: Path) -> None:
     source = WorkspaceSettings.create(tmp_path / "source", "Portable memory")
     source_service = WikiFirstService(source)
     source_service.create_packet(
         user_note="Мысль, которая должна переехать.",
-        files=[("context.txt", "text/plain", b"portable context\n")],
+        files=[
+            ("context.txt", "text/plain", b"portable context\n"),
+            PacketUpload("scan.png", "image/png", PNG, "store"),
+        ],
         urls=["https://example.com/portable"],
+    )
+    inbox = next(
+        item for item in source_service.storage.notebooks() if item["system_key"] == "inbox"
+    )
+    note = source_service.create_note("Portable note", "Local-first body.", str(inbox["id"]))
+    source_service.storage.add_note_attachment(
+        str(note["id"]), name="document.pdf", mime_type="application/pdf", data=b"portable pdf"
     )
     (source.root / "personal-binary.bin").write_bytes(b"complete workspace payload")
     archive = create_workspace_archive(source.root, tmp_path / "portable.memorex.zip")
@@ -48,8 +61,19 @@ def test_full_workspace_restore_preserves_previous_workspace_as_backup(tmp_path:
     assert restored_settings.name == "Portable memory"
     assert (target.root / "personal-binary.bin").read_bytes() == b"complete workspace payload"
     assert not (target.root / "local-only.txt").exists()
-    packets = WikiStorage(restored_settings).packets()
+    restored_storage = WikiStorage(restored_settings)
+    restored_storage.initialize()
+    packets = restored_storage.packets()
     assert [packet["user_note"] for packet in packets] == ["Мысль, которая должна переехать."]
+    image_item = next(item for item in packets[0]["items"] if item["display_name"] == "scan.png")
+    restored_image = restored_storage.packet_item(str(packets[0]["id"]), str(image_item["id"]))
+    assert (restored_storage.root / str(restored_image["object_path"])).read_bytes() == PNG
+    restored_note = restored_storage.note(str(note["id"]))
+    restored_attachment = restored_note["attachments"][0]
+    assert restored_attachment["display_name"] == "document.pdf"
+    assert (
+        restored_storage.root / restored_attachment["object_path"]
+    ).read_bytes() == b"portable pdf"
 
     recovered_local = restore_workspace_archive(
         restored.safety_backup, tmp_path / "recovered-local"

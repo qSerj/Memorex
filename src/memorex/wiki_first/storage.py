@@ -13,8 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from memorex.config import WorkspaceSettings
+from memorex.wiki_first.models import PacketUpload
 
 MIGRATIONS = Path(__file__).parent.parent / "migrations"
+TEXT_SUFFIXES = {".md", ".txt"}
+IMAGE_MIME_TYPES = {
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -112,6 +120,39 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     role TEXT NOT NULL, content TEXT NOT NULL, snapshot_id TEXT REFERENCES snapshots(id),
     runner TEXT, model TEXT, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS notebooks (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, system_key TEXT UNIQUE,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
+    notebook_id TEXT NOT NULL REFERENCES notebooks(id),
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS note_attachments (
+    id TEXT PRIMARY KEY, note_id TEXT NOT NULL REFERENCES notes(id),
+    source_revision_id INTEGER NOT NULL REFERENCES source_revisions(id),
+    display_name TEXT NOT NULL, mime_type TEXT NOT NULL,
+    ordinal INTEGER NOT NULL, created_at TEXT NOT NULL, removed_at TEXT,
+    UNIQUE(note_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS discussion_notes (
+    session_id TEXT NOT NULL REFERENCES chat_sessions(id),
+    note_id TEXT NOT NULL REFERENCES notes(id), ordinal INTEGER NOT NULL,
+    created_at TEXT NOT NULL, PRIMARY KEY(session_id, note_id)
+);
+CREATE TABLE IF NOT EXISTS discussion_turns (
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES chat_sessions(id),
+    question_message_id INTEGER NOT NULL REFERENCES chat_messages(id),
+    answer_message_id INTEGER REFERENCES chat_messages(id), task_id TEXT,
+    status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discussion_turn_notes (
+    turn_id TEXT NOT NULL REFERENCES discussion_turns(id),
+    note_id TEXT NOT NULL REFERENCES notes(id),
+    snapshot_id TEXT NOT NULL REFERENCES snapshots(id), ordinal INTEGER NOT NULL,
+    PRIMARY KEY(turn_id, note_id)
+);
 CREATE TABLE IF NOT EXISTS task_events (
     id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, job_id TEXT, phase TEXT NOT NULL,
     payload_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -177,6 +218,7 @@ class WikiStorage:
                     (snapshot_id, now),
                 )
         self.reconcile_packet_queue()
+        self.reconcile_notes()
         self.rebuild_fts()
         self.sync_vault()
         return {"root": str(self.root), "snapshot": self.active_snapshot()["id"]}
@@ -301,19 +343,40 @@ class WikiStorage:
         self,
         *,
         user_note: str,
-        files: list[tuple[str, str | None, bytes]],
+        files: list[PacketUpload],
         urls: list[str],
     ) -> dict[str, Any]:
         note = user_note.strip()
         if not note and not files and not urls:
             raise ValueError("Packet must contain a note, file, or URL")
-        for name, _mime_type, _data in files:
+        validated_files: list[tuple[PacketUpload, str, str]] = []
+        for upload in files:
+            name = upload.name
+            suffix = Path(name).suffix.lower()
             if (
                 name != Path(name).name
                 or "\\" in name
-                or Path(name).suffix.lower() not in {".md", ".txt"}
+                or suffix not in TEXT_SUFFIXES | IMAGE_MIME_TYPES.keys()
             ):
                 raise ValueError(f"Unsafe or unsupported Packet filename: {name}")
+            instruction = upload.analysis_instruction.strip()
+            if len(instruction) > 2000:
+                raise ValueError(f"Image analysis instruction is too long: {name}")
+            if suffix in TEXT_SUFFIXES:
+                if upload.processing_mode != "analyze":
+                    raise ValueError(f"Text Packet files must be analyzed: {name}")
+                try:
+                    upload.data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"Source is not UTF-8: {name}") from exc
+                mime_type = "text/markdown" if suffix == ".md" else "text/plain"
+                source_kind = "file"
+            else:
+                mime_type = _image_mime_type(upload.data)
+                if mime_type != IMAGE_MIME_TYPES[suffix]:
+                    raise ValueError(f"Image content does not match its filename: {name}")
+                source_kind = "image"
+            validated_files.append((upload, mime_type, source_kind))
         if any(not url.strip() for url in urls):
             raise ValueError("Packet URLs must not be empty")
 
@@ -324,18 +387,26 @@ class WikiStorage:
             note_data = f"# Сообщение пользователя\n\n{note}\n".encode()
             prepared_note = self._prepare_text_bytes(note_data, f"packet://{packet_id}/note.md")
         prepared_files = []
-        for ordinal, (name, mime_type, data) in enumerate(files):
+        for ordinal, (upload, mime_type, source_kind) in enumerate(validated_files):
             item_id = uuid.uuid4().hex[:12]
+            name = upload.name
             canonical = f"packet://{packet_id}/{item_id}/{name}"
+            prepared = (
+                self._prepare_text_bytes(upload.data, canonical)
+                if source_kind == "file"
+                else self._prepare_image_bytes(upload.data, canonical, mime_type)
+            )
             prepared_files.append(
                 (
                     item_id,
                     ordinal,
                     name,
-                    mime_type
-                    or ("text/markdown" if Path(name).suffix.lower() == ".md" else "text/plain"),
+                    mime_type,
                     canonical,
-                    self._prepare_text_bytes(data, canonical),
+                    source_kind,
+                    upload.processing_mode,
+                    upload.analysis_instruction.strip(),
+                    prepared,
                 )
             )
 
@@ -357,19 +428,30 @@ class WikiStorage:
                 "VALUES (?,?,?,?,?)",
                 (packet_id, note, note_revision_id, now, now),
             )
-            for item_id, ordinal, name, mime_type, canonical, prepared in prepared_files:
+            for (
+                item_id,
+                ordinal,
+                name,
+                mime_type,
+                canonical,
+                source_kind,
+                processing_mode,
+                instruction,
+                prepared,
+            ) in prepared_files:
                 checksum, object_path, normalized_path = prepared
                 revision = self._register_text(
                     connection,
                     canonical_path=canonical,
-                    kind="file",
+                    kind=source_kind,
                     checksum=checksum,
                     object_path=object_path,
                     normalized_path=normalized_path,
                 )
                 connection.execute(
                     "INSERT INTO packet_items(id,packet_id,ordinal,kind,display_name,mime_type,"
-                    "source_revision_id,status,created_at) VALUES (?,?,?,?,?,?,?,'ready',?)",
+                    "source_revision_id,status,processing_mode,analysis_instruction,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,'ready',?,?,?)",
                     (
                         item_id,
                         packet_id,
@@ -378,6 +460,8 @@ class WikiStorage:
                         name,
                         mime_type,
                         int(revision["id"]),
+                        processing_mode,
+                        instruction,
                         now,
                     ),
                 )
@@ -396,7 +480,7 @@ class WikiStorage:
                         now,
                     ),
                 )
-            if note_revision_id is not None or prepared_files:
+            if note_revision_id is not None or any(item[6] == "analyze" for item in prepared_files):
                 connection.execute(
                     "INSERT INTO packet_queue(packet_id,status,attempt_count,available_at,"
                     "created_at,updated_at) VALUES (?,'queued',0,?,?,?)",
@@ -455,6 +539,10 @@ class WikiStorage:
         result["waiting_importer_count"] = sum(
             item["status"] == "waiting_importer" for item in result["items"]
         )
+        result["stored_only_count"] = sum(
+            item["kind"] == "file" and item["processing_mode"] == "store"
+            for item in result["items"]
+        )
         result["state"] = self._packet_state(result)
         return result
 
@@ -473,29 +561,47 @@ class WikiStorage:
             if packet is None:
                 raise ValueError(f"Unknown Packet: {packet_id}")
             items = connection.execute(
-                "SELECT source_revision_id FROM packet_items WHERE packet_id = ? "
-                "AND source_revision_id IS NOT NULL ORDER BY ordinal",
+                "SELECT sr.*, s.canonical_path, s.kind, pi.mime_type, pi.processing_mode, "
+                "pi.analysis_instruction, pi.ordinal FROM packet_items pi "
+                "JOIN source_revisions sr ON sr.id = pi.source_revision_id "
+                "JOIN sources s ON s.id = sr.source_id WHERE pi.packet_id = ? "
+                "AND pi.source_revision_id IS NOT NULL AND pi.processing_mode = 'analyze' "
+                "AND sr.applied_job_id IS NULL ORDER BY pi.ordinal",
                 (packet_id,),
             ).fetchall()
-            revision_ids = [
-                int(revision_id)
-                for revision_id in [
-                    packet["note_source_revision_id"],
-                    *(item["source_revision_id"] for item in items),
-                ]
-                if revision_id is not None
-            ]
-            if not revision_ids:
-                return []
-            placeholders = ",".join("?" for _ in revision_ids)
-            rows = connection.execute(
-                "SELECT sr.*, s.canonical_path, s.kind FROM source_revisions sr "
-                "JOIN sources s ON s.id = sr.source_id WHERE sr.id IN ("
-                f"{placeholders}) AND sr.applied_job_id IS NULL",
-                revision_ids,
-            ).fetchall()
-        by_id = {int(row["id"]): dict(row) for row in rows}
-        return [by_id[revision_id] for revision_id in revision_ids if revision_id in by_id]
+            rows: list[dict[str, Any]] = []
+            if packet["note_source_revision_id"] is not None:
+                note = connection.execute(
+                    "SELECT sr.*, s.canonical_path, s.kind FROM source_revisions sr "
+                    "JOIN sources s ON s.id = sr.source_id WHERE sr.id = ? "
+                    "AND sr.applied_job_id IS NULL",
+                    (packet["note_source_revision_id"],),
+                ).fetchone()
+                if note is not None:
+                    rows.append(
+                        {
+                            **dict(note),
+                            "mime_type": "text/markdown",
+                            "processing_mode": "analyze",
+                            "analysis_instruction": "",
+                            "ordinal": -1,
+                        }
+                    )
+            rows.extend(dict(item) for item in items)
+        return rows
+
+    def packet_item(self, packet_id: str, item_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT pi.*, sr.object_path, sr.sha256, s.kind AS source_kind "
+                "FROM packet_items pi LEFT JOIN source_revisions sr "
+                "ON sr.id = pi.source_revision_id LEFT JOIN sources s ON s.id = sr.source_id "
+                "WHERE pi.packet_id = ? AND pi.id = ?",
+                (packet_id, item_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown Packet item: {item_id}")
+        return dict(row)
 
     def _packet_state(self, packet: dict[str, Any]) -> str:
         queue = packet.get("queue")
@@ -521,7 +627,11 @@ class WikiStorage:
                 "cancelled": "failed",
                 "rejected": "ready",
             }.get(status, status)
-        return "ready" if packet["processable_count"] else "waiting_importer"
+        if packet["processable_count"]:
+            return "ready"
+        if packet["waiting_importer_count"]:
+            return "waiting_importer"
+        return "stored"
 
     @staticmethod
     def _completed_packet_state(packet: dict[str, Any]) -> str:
@@ -648,7 +758,7 @@ class WikiStorage:
             row = connection.execute(
                 "SELECT * FROM packet_queue WHERE "
                 "(status = 'queued' OR (status = 'retry_wait' AND available_at <= ?)) "
-                "AND NOT EXISTS (SELECT 1 FROM jobs WHERE status IN ('running','proposed')) "
+                "AND NOT EXISTS (SELECT 1 FROM jobs WHERE status = 'running') "
                 "ORDER BY available_at, created_at LIMIT 1",
                 (available,),
             ).fetchone()
@@ -744,10 +854,10 @@ class WikiStorage:
         now = utc_now()
         with self.connection() as connection:
             unfinished = connection.execute(
-                "SELECT id FROM jobs WHERE status IN ('running', 'proposed') LIMIT 1"
+                "SELECT id FROM jobs WHERE status = 'running' LIMIT 1"
             ).fetchone()
             if unfinished is not None:
-                raise ValueError(f"Finish or reject proposal {unfinished['id']} first")
+                raise ValueError(f"Wait for running job {unfinished['id']} to finish")
             connection.execute(
                 "INSERT INTO jobs(id, kind, status, base_snapshot_id, runner, user_input, "
                 "created_at, updated_at) VALUES (?, ?, 'running', ?, ?, ?, ?, ?)",
@@ -769,10 +879,29 @@ class WikiStorage:
         return self.get_job(job_id)
 
     def recover_interrupted_jobs(self) -> int:
-        """Mark jobs abandoned by a terminated process as retryable."""
+        """Recover abandoned work, preserving an earlier reviewable proposal."""
         with self.connection() as connection:
             now = utc_now()
-            cursor = connection.execute(
+            restorable = connection.execute(
+                "SELECT id FROM jobs WHERE status = 'running' AND current_revision > 0 "
+                "AND EXISTS (SELECT 1 FROM proposal_revisions pr WHERE pr.job_id = jobs.id "
+                "AND pr.revision_no = jobs.current_revision)"
+            ).fetchall()
+            restorable_ids = [str(row["id"]) for row in restorable]
+            if restorable_ids:
+                placeholders = ",".join("?" for _ in restorable_ids)
+                message = "revision was interrupted; previous proposal preserved"
+                connection.execute(
+                    f"UPDATE jobs SET status = 'proposed', rejection_reason = ?, "
+                    f"updated_at = ? WHERE id IN ({placeholders})",
+                    (message, now, *restorable_ids),
+                )
+                connection.execute(
+                    f"UPDATE packet_queue SET status = 'review', last_error = ?, updated_at = ? "
+                    f"WHERE last_job_id IN ({placeholders})",
+                    (message, now, *restorable_ids),
+                )
+            failed = connection.execute(
                 "UPDATE jobs SET status = 'failed', "
                 "rejection_reason = 'server or CLI process was interrupted', updated_at = ? "
                 "WHERE status = 'running'",
@@ -784,7 +913,7 @@ class WikiStorage:
                 "WHERE status = 'running'",
                 (now, now),
             )
-            return int(cursor.rowcount)
+            return len(restorable_ids) + int(failed.rowcount)
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self.connection() as connection:
@@ -814,6 +943,7 @@ class WikiStorage:
         validation_json: str,
         feedback: str | None,
         retrieval_json: str = "{}",
+        base_snapshot_id: str | None = None,
     ) -> None:
         now = utc_now()
         with self.connection() as connection:
@@ -832,16 +962,59 @@ class WikiStorage:
                     retrieval_json,
                 ),
             )
-            connection.execute(
-                "UPDATE jobs SET status = 'proposed', current_revision = ?, updated_at = ? "
-                "WHERE id = ?",
-                (revision_no, now, job_id),
-            )
+            if base_snapshot_id is None:
+                connection.execute(
+                    "UPDATE jobs SET status = 'proposed', current_revision = ?, "
+                    "rejection_reason = NULL, updated_at = ? WHERE id = ?",
+                    (revision_no, now, job_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE jobs SET status = 'proposed', current_revision = ?, "
+                    "base_snapshot_id = ?, rejection_reason = NULL, updated_at = ? WHERE id = ?",
+                    (revision_no, base_snapshot_id, now, job_id),
+                )
             connection.execute(
                 "UPDATE packet_queue SET status = 'review', available_at = ?, "
                 "last_job_id = ?, last_error = NULL, updated_at = ? "
                 "WHERE packet_id = (SELECT packet_id FROM job_packets WHERE job_id = ?)",
                 (now, job_id, now, job_id),
+            )
+
+    def restore_proposal_after_failed_revision(self, job_id: str, error: str) -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE jobs SET status = 'proposed', rejection_reason = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'running' AND current_revision > 0",
+                (error, now, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Job {job_id} has no proposal to restore")
+            connection.execute(
+                "UPDATE packet_queue SET status = 'review', available_at = ?, "
+                "last_job_id = ?, last_error = ?, updated_at = ? "
+                "WHERE packet_id = (SELECT packet_id FROM job_packets WHERE job_id = ?)",
+                (now, job_id, error, now, job_id),
+            )
+
+    def requeue_stale_proposal(self, job_id: str, reason: str) -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            packet = connection.execute(
+                "SELECT packet_id FROM job_packets WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if packet is None:
+                raise ValueError("Only Packet proposals can be requeued automatically")
+            connection.execute(
+                "UPDATE jobs SET status = 'stale', rejection_reason = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'proposed'",
+                (reason, now, job_id),
+            )
+            connection.execute(
+                "UPDATE packet_queue SET status = 'queued', available_at = ?, "
+                "last_error = ?, updated_at = ? WHERE packet_id = ?",
+                (now, reason, now, packet["packet_id"]),
             )
 
     def finish_job_without_changes(
@@ -1083,11 +1256,16 @@ class WikiStorage:
         return [dict(row) for row in rows]
 
     def latest_proposal(self) -> dict[str, Any] | None:
+        proposals = self.proposals(limit=1)
+        return proposals[0] if proposals else None
+
+    def proposals(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connection() as connection:
-            row = connection.execute(
-                "SELECT id FROM jobs WHERE status = 'proposed' ORDER BY updated_at DESC LIMIT 1"
-            ).fetchone()
-        return self.proposal(str(row["id"])) if row else None
+            rows = connection.execute(
+                "SELECT id FROM jobs WHERE status = 'proposed' ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self.proposal(str(row["id"])) for row in rows]
 
     def verify_active(self) -> None:
         snapshot = self.active_snapshot()
@@ -1109,6 +1287,320 @@ class WikiStorage:
             )
             result.append({"slug": path.stem, "title": first, "text": text, "path": path})
         return result
+
+    def reconcile_notes(self) -> None:
+        """Register active Wiki pages as notes without changing existing organization."""
+        pages = [page for page in self.list_pages() if page["slug"] != "README"]
+        readme = next((page for page in self.list_pages() if page["slug"] == "README"), None)
+        suggested: dict[str, str] = {}
+        heading = ""
+        with self.connection() as connection:
+            import_legacy_readme = (
+                connection.execute("SELECT 1 FROM notebooks WHERE system_key = 'inbox'").fetchone()
+                is None
+            )
+        if readme and import_legacy_readme:
+            for line in str(readme["text"]).splitlines():
+                if line.startswith("## "):
+                    heading = line[3:].strip()
+                if heading:
+                    for slug in WIKI_LINK.findall(line):
+                        suggested.setdefault(slug, heading)
+        now = utc_now()
+        with self.connection() as connection:
+            inbox = connection.execute(
+                "SELECT id FROM notebooks WHERE system_key = 'inbox'"
+            ).fetchone()
+            if inbox is None:
+                inbox_id = uuid.uuid4().hex[:12]
+                connection.execute(
+                    "INSERT INTO notebooks(id,name,system_key,created_at,updated_at) "
+                    "VALUES (?,?,'inbox',?,?)",
+                    (inbox_id, "Входящие", now, now),
+                )
+            else:
+                inbox_id = str(inbox["id"])
+            notebook_ids: dict[str, str] = {}
+            for name in dict.fromkeys(suggested.values()):
+                row = connection.execute(
+                    "SELECT id FROM notebooks WHERE name = ?", (name,)
+                ).fetchone()
+                notebook_id = str(row["id"]) if row else uuid.uuid4().hex[:12]
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO notebooks(id,name,created_at,updated_at) VALUES (?,?,?,?)",
+                        (notebook_id, name, now, now),
+                    )
+                notebook_ids[name] = notebook_id
+            existing = {
+                str(row["slug"]) for row in connection.execute("SELECT slug FROM notes").fetchall()
+            }
+            for page in pages:
+                slug = str(page["slug"])
+                if slug in existing:
+                    continue
+                notebook_id = notebook_ids.get(suggested.get(slug, ""), inbox_id)
+                connection.execute(
+                    "INSERT INTO notes(id,slug,notebook_id,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (uuid.uuid4().hex[:12], slug, notebook_id, now, now),
+                )
+
+    def notebooks(self) -> list[dict[str, Any]]:
+        active = {str(page["slug"]) for page in self.list_pages() if page["slug"] != "README"}
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT nb.*, n.slug FROM notebooks nb LEFT JOIN notes n "
+                "ON n.notebook_id = nb.id ORDER BY nb.system_key IS NULL, nb.name"
+            ).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            notebook = grouped.setdefault(
+                str(row["id"]),
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "system_key": row["system_key"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "note_count": 0,
+                },
+            )
+            if row["slug"] in active:
+                notebook["note_count"] = int(notebook["note_count"]) + 1
+        return list(grouped.values())
+
+    def create_notebook(self, name: str) -> dict[str, Any]:
+        clean = name.strip()
+        if not clean or len(clean) > 120:
+            raise ValueError("Notebook name must contain 1-120 characters")
+        notebook_id = uuid.uuid4().hex[:12]
+        now = utc_now()
+        try:
+            with self.connection() as connection:
+                connection.execute(
+                    "INSERT INTO notebooks(id,name,created_at,updated_at) VALUES (?,?,?,?)",
+                    (notebook_id, clean, now, now),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Notebook already exists: {clean}") from exc
+        return self.notebook(notebook_id)
+
+    def notebook(self, notebook_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM notebooks WHERE id = ?", (notebook_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown notebook: {notebook_id}")
+        return dict(row)
+
+    def rename_notebook(self, notebook_id: str, name: str) -> None:
+        notebook = self.notebook(notebook_id)
+        if notebook["system_key"]:
+            raise ValueError("The Inbox notebook cannot be renamed")
+        clean = name.strip()
+        if not clean or len(clean) > 120:
+            raise ValueError("Notebook name must contain 1-120 characters")
+        try:
+            with self.connection() as connection:
+                connection.execute(
+                    "UPDATE notebooks SET name = ?, updated_at = ? WHERE id = ?",
+                    (clean, utc_now(), notebook_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Notebook already exists: {clean}") from exc
+
+    def delete_notebook(self, notebook_id: str) -> None:
+        notebook = self.notebook(notebook_id)
+        if notebook["system_key"]:
+            raise ValueError("The Inbox notebook cannot be deleted")
+        with self.connection() as connection:
+            inbox = connection.execute(
+                "SELECT id FROM notebooks WHERE system_key = 'inbox'"
+            ).fetchone()
+            connection.execute(
+                "UPDATE notes SET notebook_id = ?, updated_at = ? WHERE notebook_id = ?",
+                (inbox["id"], utc_now(), notebook_id),
+            )
+            connection.execute("DELETE FROM notebooks WHERE id = ?", (notebook_id,))
+
+    def notes(self, notebook_id: str | None = None) -> list[dict[str, Any]]:
+        pages = {str(page["slug"]): page for page in self.list_pages() if page["slug"] != "README"}
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT n.*, nb.name notebook_name FROM notes n JOIN notebooks nb "
+                "ON nb.id = n.notebook_id "
+                + ("WHERE n.notebook_id = ? " if notebook_id else "")
+                + "ORDER BY n.updated_at DESC",
+                (notebook_id,) if notebook_id else (),
+            ).fetchall()
+        return [
+            {**dict(row), **pages[str(row["slug"])]} for row in rows if str(row["slug"]) in pages
+        ]
+
+    def note(self, note_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT n.*, nb.name notebook_name FROM notes n JOIN notebooks nb "
+                "ON nb.id = n.notebook_id WHERE n.id = ?",
+                (note_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown note: {note_id}")
+        page = next((page for page in self.list_pages() if page["slug"] == row["slug"]), None)
+        if page is None:
+            raise ValueError(f"Note is not present in the active memory: {note_id}")
+        return {**dict(row), **page, "attachments": self.note_attachments(note_id)}
+
+    def note_for_slug(self, slug: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute("SELECT id FROM notes WHERE slug = ?", (slug,)).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown note slug: {slug}")
+        return self.note(str(row["id"]))
+
+    def move_note(self, note_id: str, notebook_id: str) -> None:
+        self.notebook(notebook_id)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE notes SET notebook_id = ?, updated_at = ? WHERE id = ?",
+                (notebook_id, utc_now(), note_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown note: {note_id}")
+
+    def activate_manual_note(
+        self,
+        *,
+        expected_snapshot_id: str,
+        snapshot_id: str,
+        relative_path: str,
+        tree_hash: str,
+        note_id: str,
+        slug: str,
+        notebook_id: str,
+        new_note: bool,
+    ) -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            active = connection.execute(
+                "SELECT snapshot_id FROM activations ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if active is None or str(active["snapshot_id"]) != expected_snapshot_id:
+                raise ValueError("The memory changed while this note was being edited")
+            self.notebook(notebook_id)
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?, ?, ?, ?, NULL, ?)",
+                (snapshot_id, expected_snapshot_id, relative_path, tree_hash, now),
+            )
+            connection.execute(
+                "INSERT INTO activations(snapshot_id,previous_snapshot_id,reason,created_at) "
+                "VALUES (?,?,?,?)",
+                (
+                    snapshot_id,
+                    expected_snapshot_id,
+                    f"manual-{'create' if new_note else 'edit'}:{note_id}",
+                    now,
+                ),
+            )
+            if new_note:
+                connection.execute(
+                    "INSERT INTO notes(id,slug,notebook_id,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (note_id, slug, notebook_id, now, now),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE notes SET notebook_id = ?, updated_at = ? WHERE id = ? AND slug = ?",
+                    (notebook_id, now, note_id, slug),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(f"Unknown note: {note_id}")
+
+    def add_note_attachment(
+        self, note_id: str, *, name: str, mime_type: str, data: bytes
+    ) -> dict[str, Any]:
+        self.note(note_id)
+        safe_name = Path(name).name
+        if not safe_name or safe_name != name or "\\" in name:
+            raise ValueError(f"Unsafe attachment filename: {name}")
+        attachment_id = uuid.uuid4().hex[:12]
+        canonical = f"note://{note_id}/{attachment_id}/{safe_name}"
+        checksum, object_path, normalized_path = self._prepare_binary_bytes(
+            data, canonical, mime_type
+        )
+        now = utc_now()
+        with self.connection() as connection:
+            revision = self._register_text(
+                connection,
+                canonical_path=canonical,
+                kind="attachment",
+                checksum=checksum,
+                object_path=object_path,
+                normalized_path=normalized_path,
+            )
+            ordinal = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM note_attachments WHERE note_id = ?",
+                    (note_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO note_attachments(id,note_id,source_revision_id,display_name,"
+                "mime_type,ordinal,created_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    attachment_id,
+                    note_id,
+                    int(revision["id"]),
+                    safe_name,
+                    mime_type,
+                    ordinal,
+                    now,
+                ),
+            )
+            connection.execute("UPDATE notes SET updated_at = ? WHERE id = ?", (now, note_id))
+        return self.note_attachment(note_id, attachment_id)
+
+    def note_attachments(
+        self, note_id: str, *, include_removed: bool = False
+    ) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT na.*, sr.object_path, sr.normalized_path, sr.sha256 "
+                "FROM note_attachments na JOIN source_revisions sr "
+                "ON sr.id = na.source_revision_id WHERE na.note_id = ? "
+                + ("" if include_removed else "AND na.removed_at IS NULL ")
+                + "ORDER BY na.ordinal",
+                (note_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def note_attachment(self, note_id: str, attachment_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT na.*, sr.object_path, sr.normalized_path, sr.sha256 "
+                "FROM note_attachments na JOIN source_revisions sr "
+                "ON sr.id = na.source_revision_id WHERE na.note_id = ? AND na.id = ?",
+                (note_id, attachment_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown note attachment: {attachment_id}")
+        return dict(row)
+
+    def remove_note_attachment(self, note_id: str, attachment_id: str) -> None:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE note_attachments SET removed_at = ? "
+                "WHERE note_id = ? AND id = ? AND removed_at IS NULL",
+                (utc_now(), note_id, attachment_id),
+            )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    "UPDATE notes SET updated_at = ? WHERE id = ?", (utc_now(), note_id)
+                )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Unknown active note attachment: {attachment_id}")
 
     def rebuild_fts(self) -> None:
         if not self.database_path.exists():
@@ -1160,6 +1652,44 @@ class WikiStorage:
                     selected.append(slug)
         return selected
 
+    def search_notes(self, text: str, *, limit: int = 30) -> list[dict[str, Any]]:
+        query_text = text.strip()
+        if not query_text:
+            return []
+        terms = list(dict.fromkeys(WORD.findall(query_text.lower())))[:24]
+        slugs: list[str] = []
+        if terms:
+            query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+            with self.connection() as connection:
+                try:
+                    rows = connection.execute(
+                        "SELECT slug FROM wiki_fts WHERE wiki_fts MATCH ? "
+                        "ORDER BY bm25(wiki_fts) LIMIT ?",
+                        (query, limit),
+                    ).fetchall()
+                    slugs = [str(row["slug"]) for row in rows if row["slug"] != "README"]
+                except sqlite3.OperationalError:
+                    slugs = []
+        notes = self.notes()
+        by_slug = {str(note["slug"]): note for note in notes}
+        result = [by_slug[slug] for slug in slugs if slug in by_slug]
+        folded = query_text.casefold()
+        for note in notes:
+            if note in result:
+                continue
+            if folded in (str(note["title"]) + "\n" + str(note["text"])).casefold():
+                result.append(note)
+            if len(result) >= limit:
+                break
+        for note in result:
+            plain = " ".join(
+                re.sub(r"^[# |\-`)]+", "", line).rstrip()
+                for line in str(note["text"]).splitlines()[1:]
+                if line.strip() and not line.startswith("## Источники")
+            )
+            note["snippet"] = plain[:240]
+        return result[:limit]
+
     def add_task_event(
         self, task_id: str, phase: str, payload: dict[str, object], job_id: str | None = None
     ) -> None:
@@ -1180,6 +1710,7 @@ class WikiStorage:
                 "message",
                 "status",
                 "job_id",
+                "next",
             }
         }
         with self.connection() as connection:
@@ -1205,6 +1736,163 @@ class WikiStorage:
                 "INSERT INTO chat_sessions VALUES (?,?,?,?)", (session_id, title[:120], now, now)
             )
         return session_id
+
+    def create_discussion(self, title: str, note_ids: list[str]) -> dict[str, Any]:
+        clean = title.strip() or "Новое обсуждение"
+        unique = list(dict.fromkeys(note_ids))
+        for note_id in unique:
+            self.note(note_id)
+        session_id = self.create_chat(clean)
+        now = utc_now()
+        with self.connection() as connection:
+            connection.executemany(
+                "INSERT INTO discussion_notes(session_id,note_id,ordinal,created_at) "
+                "VALUES (?,?,?,?)",
+                [(session_id, note_id, index, now) for index, note_id in enumerate(unique)],
+            )
+        return self.discussion(session_id)
+
+    def discussion(self, session_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            session = connection.execute(
+                "SELECT * FROM chat_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT note_id FROM discussion_notes WHERE session_id = ? ORDER BY ordinal",
+                (session_id,),
+            ).fetchall()
+            turns = connection.execute(
+                "SELECT * FROM discussion_turns WHERE session_id = ? ORDER BY created_at",
+                (session_id,),
+            ).fetchall()
+        if session is None:
+            raise ValueError(f"Unknown discussion: {session_id}")
+        notes = []
+        for row in rows:
+            try:
+                notes.append(self.note(str(row["note_id"])))
+            except ValueError:
+                continue
+        return {**dict(session), "notes": notes, "turns": [dict(row) for row in turns]}
+
+    def set_discussion_notes(self, session_id: str, note_ids: list[str]) -> None:
+        self.discussion(session_id)
+        unique = list(dict.fromkeys(note_ids))
+        for note_id in unique:
+            self.note(note_id)
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("DELETE FROM discussion_notes WHERE session_id = ?", (session_id,))
+            connection.executemany(
+                "INSERT INTO discussion_notes(session_id,note_id,ordinal,created_at) "
+                "VALUES (?,?,?,?)",
+                [(session_id, note_id, index, now) for index, note_id in enumerate(unique)],
+            )
+
+    def create_discussion_turn(self, session_id: str, question: str) -> dict[str, Any]:
+        if not question.strip():
+            raise ValueError("Discussion question must not be empty")
+        discussion = self.discussion(session_id)
+        if not discussion["notes"]:
+            raise ValueError("Choose at least one note for the discussion")
+        snapshot = self.active_snapshot()
+        turn_id = uuid.uuid4().hex[:12]
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "INSERT INTO chat_messages(session_id,role,content,snapshot_id,created_at) "
+                "VALUES (?, 'user', ?, ?, ?)",
+                (session_id, question, snapshot["id"], now),
+            )
+            message_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO discussion_turns(id,session_id,question_message_id,status,"
+                "created_at,updated_at) VALUES (?,?,?,'pending',?,?)",
+                (turn_id, session_id, message_id, now, now),
+            )
+            connection.executemany(
+                "INSERT INTO discussion_turn_notes(turn_id,note_id,snapshot_id,ordinal) "
+                "VALUES (?,?,?,?)",
+                [
+                    (turn_id, note["id"], snapshot["id"], index)
+                    for index, note in enumerate(discussion["notes"])
+                ],
+            )
+            connection.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (now, session_id)
+            )
+        return self.discussion_turn(turn_id)
+
+    def discussion_turn(self, turn_id: str) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT dt.*, cm.content question FROM discussion_turns dt "
+                "JOIN chat_messages cm ON cm.id = dt.question_message_id WHERE dt.id = ?",
+                (turn_id,),
+            ).fetchone()
+            note_rows = connection.execute(
+                "SELECT note_id,snapshot_id FROM discussion_turn_notes "
+                "WHERE turn_id = ? ORDER BY ordinal",
+                (turn_id,),
+            ).fetchall()
+        if row is None:
+            raise ValueError(f"Unknown discussion turn: {turn_id}")
+        return {
+            **dict(row),
+            "note_ids": [str(item["note_id"]) for item in note_rows],
+            "snapshot_id": str(note_rows[0]["snapshot_id"]) if note_rows else None,
+        }
+
+    def start_discussion_turn(self, turn_id: str, task_id: str) -> None:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE discussion_turns SET status='running',task_id=?,error=NULL,updated_at=? "
+                "WHERE id=? AND status IN ('pending','failed')",
+                (task_id, utc_now(), turn_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError(f"Discussion turn is not runnable: {turn_id}")
+
+    def finish_discussion_turn(self, turn_id: str, answer: str, *, runner: str, model: str) -> int:
+        turn = self.discussion_turn(turn_id)
+        now = utc_now()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "INSERT INTO chat_messages(session_id,role,content,snapshot_id,runner,model,"
+                "created_at) VALUES (?,'assistant',?,?,?,?,?)",
+                (turn["session_id"], answer, turn["snapshot_id"], runner, model, now),
+            )
+            answer_id = int(cursor.lastrowid)
+            connection.execute(
+                "UPDATE discussion_turns SET answer_message_id=?,status='succeeded',"
+                "error=NULL,updated_at=? WHERE id=?",
+                (answer_id, now, turn_id),
+            )
+            connection.execute(
+                "UPDATE chat_sessions SET updated_at=? WHERE id=?",
+                (now, turn["session_id"]),
+            )
+        return answer_id
+
+    def fail_discussion_turn(self, turn_id: str, error: str, status: str = "failed") -> None:
+        if status not in {"failed", "cancelled"}:
+            raise ValueError(f"Invalid discussion failure status: {status}")
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE discussion_turns SET status=?,error=?,updated_at=? WHERE id=?",
+                (status, error, utc_now(), turn_id),
+            )
+
+    def recover_interrupted_discussions(self) -> int:
+        if not self.database_path.exists():
+            return 0
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE discussion_turns SET status='failed',error='interrupted; retry available',"
+                "updated_at=? WHERE status IN ('pending','running')",
+                (utc_now(),),
+            )
+        return int(cursor.rowcount)
 
     def add_chat_message(
         self,
@@ -1245,6 +1933,15 @@ class WikiStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def chat_message(self, message_id: int) -> dict[str, Any]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_messages WHERE id = ?", (message_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown discussion message: {message_id}")
+        return dict(row)
+
     def sync_vault(self) -> Path:
         snapshot = self.active_snapshot()
         source = self.snapshot_path(snapshot)
@@ -1273,6 +1970,41 @@ class WikiStorage:
             checksum,
             self._store_bytes(data, checksum, "raw"),
             self._store_bytes(normalized, normalized_checksum, "normalized"),
+        )
+
+    def _prepare_image_bytes(
+        self, data: bytes, label: str, mime_type: str
+    ) -> tuple[str, Path, Path]:
+        checksum = hashlib.sha256(data).hexdigest()
+        metadata = (
+            "# Изображение\n\n"
+            f"- Имя: {Path(label).name}\n"
+            f"- MIME: {mime_type}\n"
+            f"- SHA-256: {checksum}\n"
+        ).encode()
+        metadata_checksum = hashlib.sha256(metadata).hexdigest()
+        return (
+            checksum,
+            self._store_bytes(data, checksum, "raw"),
+            self._store_bytes(metadata, metadata_checksum, "normalized"),
+        )
+
+    def _prepare_binary_bytes(
+        self, data: bytes, label: str, mime_type: str
+    ) -> tuple[str, Path, Path]:
+        checksum = hashlib.sha256(data).hexdigest()
+        metadata = (
+            "# Вложение\n\n"
+            f"- Имя: {Path(label).name}\n"
+            f"- MIME: {mime_type}\n"
+            f"- Размер: {len(data)} bytes\n"
+            f"- SHA-256: {checksum}\n"
+        ).encode()
+        metadata_checksum = hashlib.sha256(metadata).hexdigest()
+        return (
+            checksum,
+            self._store_bytes(data, checksum, "raw"),
+            self._store_bytes(metadata, metadata_checksum, "normalized"),
         )
 
     def _store_bytes(self, data: bytes, checksum: str, namespace: str) -> Path:
@@ -1337,6 +2069,16 @@ def make_tree_read_only(root: Path) -> None:
     for path in root.rglob("*"):
         path.chmod(0o555 if path.is_dir() else 0o444)
     root.chmod(0o555)
+
+
+def _image_mime_type(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    raise ValueError("Unsupported or corrupt image content")
 
 
 def make_tree_writable(root: Path) -> None:

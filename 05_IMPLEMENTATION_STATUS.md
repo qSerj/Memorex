@@ -1,108 +1,104 @@
 # Implementation Status
 
-Updated: 2026-08-24
+Updated: 2026-08-25
 
-## Current Milestone: Reliable Capture on Wiki-first
+## Current milestone: usable local notes with optional AI
 
-Главный эксперимент теперь проверяет не строгость атомарного factual QA, а качество накопленной
-Wiki:
+Продуктовый центр уже смещён с «Wiki, которую редактирует модель» на локальный заметочник в духе
+Evernote. Note является основным объектом. AI-разбор и Discussions — дополнительные пути, а не
+условие доступа к памяти.
+
+Текущий пользовательский цикл:
 
 ```text
-Packet → local immutable save → persistent queue → whole-document strong-agent understanding
-       → staged Markdown Wiki proposal → human review/revise/apply
-       → immutable active snapshot → read-only agent navigation/query
+manual Note ───────────────────────────────→ edit / search / attach / history
+Packet → local save → background analysis → AI proposal → Review → Notes
+selected Notes → Discussion → AI answer ──→ optional new Note
 ```
 
-Первый milestone считается успешным продуктово только после проверки на реальных материалах:
-«модель действительно поняла происходившее и разумно встроила новое содержание». Тесты и
-валидаторы подтверждают механику, но не заменяют эту оценку.
+Следующий ещё не реализованный продуктовый слой — минимальные Commitments, после него Attention.
 
-Продуктовый ориентир — персональная внешняя память, принимающая один Packet из мысли, нескольких
-файлов и ссылок. Capture, Memory/Wiki, будущие Commitments и Attention остаются разными слоями.
-Пользователь не обязан поддерживать дисциплину разбора вручную. Полная формулировка и порядок
-небольших итераций находятся в
-[`06_EXTERNAL_MEMORY_DIRECTION.md`](06_EXTERNAL_MEMORY_DIRECTION.md).
+## Реализовано
 
-## Implemented in Wiki-first
+### Заметки без AI
 
-- Отдельный `.memorex/wiki-first/state.sqlite`; новый путь не зависит от claims schema.
-- Рекурсивное обнаружение UTF-8 TXT/Markdown, SHA-256, source revisions, immutable raw и normalized
-  objects, отсутствие обязательной metadata-формы.
-- Целые документы передаются semantic administrator; 2k-сегменты старого pipeline не являются
-  границей понимания.
-- Claude Code и Codex CLI adapters с настраиваемыми сильными моделями. Default: Claude для ingest,
-  Codex для query; одна автоматическая попытка второго runner при технической или contract-ошибке.
-- Один незавершённый proposal за раз. Ingest/tell создают staging Wiki и отчёт, но не активируют их.
-- Deterministic validator для имён страниц, H1, Wiki-links, citation labels, source paths/line
-  bounds и growth warnings.
-- Natural-language `review → revise → apply/reject`; apply всей версии атомарен и запрещён при
-  изменившемся base snapshot.
-- Immutable Wiki snapshots, activation history, rollback, tree-hash integrity guard и абсолютный
-  read-only путь для просмотра в Obsidian.
-- `wiki tell` для пользовательской мысли/поправки/приоритета через тот же управляемый ingest.
-- `wiki ask` запускает read-only навигацию по копии активной Wiki/sources; answer логируется как
-  derived result и не становится knowledge.
-- Web Packet intake атомарно сохраняет комментарий, несколько TXT/Markdown и URL как одно
-  добавление и сразу подтверждает локальную запись, не ожидая runner.
-- Постоянная SQLite-очередь отделяет Capture от анализа: один Packet имеет один текущий статус,
-  переживает перезапуск, захватывается worker атомарно и не дублируется быстрыми повторами.
-- Технический сбой runner автоматически повторяется через 5 и 30 секунд, затем Packet остаётся
-  сохранённым с ручной командой повтора. Contract/local failures не зацикливаются.
-- История model jobs сгруппирована внутри Packet; UI показывает понятный статус и причину, а во
-  время работы раз в две секунды обновляет фактический этап, runner и прошедшее время. Процент не
-  выдумывается, поскольку agent CLI не сообщает достоверную долю готовности.
-- Если runner уже закончил содержательную работу, но локальная сборка proposal упала, повторный
-  запуск сначала проверяет и восстанавливает сохранённый stage без нового модельного вызова.
-- Web-страница «Перенос» создаёт полный `.memorex.zip` с согласованными SQLite-копиями и
-  восстанавливает его в новую или существующую папку. Перед полной заменой существующий workspace
-  автоматически сохраняется в соседней `.memorex-backups/`; merge намеренно отсутствует.
-- Поддерживаемые тексты передаются в один proposal; URL пока ожидают importer, а no-op обработка не
-  создаёт идентичный snapshot.
-- Лог runner, model, CLI version, prompt version, duration, stdout/stderr и failure; секреты не
-  записываются.
-- Приватные Codex/Claude reference Wikis законсервированы в ignored nested Git + bundle. Публичный
-  полностью синтетический benchmark хранится в репозитории.
+- создание обычной Markdown-заметки;
+- ручное редактирование title/body без вызова runner;
+- новая immutable snapshot-версия и запись History при каждом сохранении;
+- optimistic conflict guard против перезаписи более новой версии;
+- автоматическая регистрация прежних тематических Wiki-страниц как Notes;
+- новые и неразобранные Notes попадают во «Входящие»;
+- страницы, созданные AI, сохраняют source footer и provenance validation.
 
-## Preserved provenance-compiler prototype
+### Организация, поиск и вложения
 
-Реализация до поворота не сломана и отмечена тегом `provenance-compiler-prototype`. В ней остаются:
+- блокноты: создание, переименование, перенос Notes и безопасное удаление с возвратом во
+  «Входящие»;
+- локальный FTS по заголовкам и тексту без модели, с текстовым fallback;
+- произвольные вложения до 10 MiB через content-addressed immutable object store;
+- inline preview изображений и скачивание остальных файлов;
+- вложения, Notes и их организация входят в full-workspace backup/restore.
 
-- metadata-gated inbox и Web UI;
-- atomic claims, lifecycle, exact evidence offsets;
-- entities, typed relations, contradiction/supersedes review;
-- user overrides, dossier, FTS query, answer validation;
-- isolated model evaluation and OpenAI-compatible providers.
+### Discussions
 
-Эта система — источник будущих компонентов, но не обязательная основа Wiki-first.
+- постоянные обсуждения по одной или нескольким явно выбранным Notes;
+- видимый и изменяемый список контекста;
+- exact snapshot каждой выбранной Note фиксируется для конкретного вопроса;
+- вопрос сохраняется до model call;
+- pending/running turn после перезапуска становится failed и доступен для retry;
+- ответ и ошибка сохраняются в истории;
+- изображения из note attachments доступны vision-runner;
+- готовый ответ можно открыть как новую редактируемую Note;
+- Discussion никогда не изменяет память автоматически.
 
-## Deliberately deferred
+### Reliable Capture и AI proposals
 
-- Telegram-specific parser, threads/replies and media;
-- Telegram bot, системные уведомления и внешние каналы Attention;
-- PDF/DOCX/HTML;
-- embeddings, vector DB, GraphRAG, communities and typed Wiki ontology;
-- automatic activation, per-claim lifecycle and mandatory exact quote;
-- cost routing or replacement of the strong semantic administrator by small/local models;
-- GigaChat runtime adapter. `/v2` remains a research target and is not discarded after one weak
-  contract run.
+- Packet из комментария, нескольких TXT/Markdown, PNG/JPEG/WebP и URL;
+- немедленное локальное сохранение originals до model call;
+- persistent SQLite queue, atomic claim и отсутствие двойного enqueue;
+- понятные этапы, elapsed time, Stop, bounded retry и восстановление готового runner-stage;
+- несколько proposals могут ждать Review и не блокируют следующие Packets;
+- независимый stale proposal rebased на текущую Wiki, конфликтующий возвращается в очередь;
+- natural-language revise и ручной Markdown editor proposal;
+- Claude запускается без глобальных MCP/plugins/hooks/Serena; Codex доступен как runner/fallback.
 
-## Next evidence-driven work
+### Переносимость и безопасность данных
 
-1. Проверить Reliable Capture на реальном потоке: закрыть приложение посреди анализа, запустить
-   снова и убедиться, что Packet дообрабатывается без потери или дубликата.
-2. Проверить Packets на коротких заметках и связанных наборах файлов, включая материал, который
-   агент разумно не переносит в Wiki.
-3. Проверить полный архив реального workspace переносом в другой абсолютный путь и обратным
-   восстановлением страховочной копии.
-4. Отдельно согласовать минимальный слой Commitments с provenance и коротким подтверждением
-   неуверенных действий; не добавлять Attention/reminder delivery заранее.
-5. Freeze the pending Claude output on the tracked synthetic fixture after its CLI quota resets;
-   the Codex baseline, incremental Wiki and query answer are already frozen.
-6. Use the CLI on a small real ignored corpus; inspect the proposal in Obsidian and apply only after
-   human review.
-7. Add a second real material on existing topics and judge accumulation, bloat, contradictions and
-   provenance honestly.
-8. Compare new outputs against the frozen Codex/Claude references. Change prompts or organization
-   before adding retrieval infrastructure if the Wiki is not intelligent enough.
-9. Extract a stable application-service boundary for a future Telegram administrator only after the
-   CLI interaction proves useful.
+- полный `.memorex.zip` всего workspace;
+- восстановление в новый или существующий workspace;
+- автоматическая страховочная копия перед полной заменой;
+- snapshots, originals, SQLite, Packets, queue, jobs, discussions и vault переносятся вместе;
+- приложение остаётся loopback-only, однопользовательским и без авторизации.
+
+### Сохранённый исследовательский фундамент
+
+Прежний provenance compiler не удалён и отмечен тегом `provenance-compiler-prototype`. В нём
+остаются atomic claims, exact evidence offsets, entities, typed relations, contradiction review,
+overrides и eval. Эти механизмы можно переиспользовать точечно; они не являются обязательным ядром
+обычной Note.
+
+## Проверено
+
+- миграции на копии существующего рабочего workspace сохранили прежние Notes и chats;
+- offline suite: 72 tests passed;
+- Ruff lint и formatting passed;
+- fake runners используются в CI, сеть и credentials для тестов не нужны.
+
+## Следующий evidence-driven шаг
+
+1. Несколько дней пользоваться заметками, вложениями, поиском и Discussions на реальных материалах.
+2. Записать неудобства интерфейса и только затем править Note UX небольшими итерациями.
+3. Отдельно согласовать минимальную схему Commitments и экран Today.
+4. Реализовать ручные Commitments до автоматического AI extraction.
+5. После проверки Today решать, нужен ли Attention и какой первый канал доставки.
+
+## Сознательно не реализовано
+
+- Commitments, Today и reminder delivery;
+- URL fetching, PDF text/OCR, audio и YouTube ingestion;
+- синхронизация, VPS mode, multi-user и мобильное приложение;
+- embeddings, vector DB, GraphRAG и обязательная ontology;
+- автоматическая активация AI-правок;
+- скрытое расширение контекста Discussion до всей базы.
+
+Каноническое направление: [`06_EXTERNAL_MEMORY_DIRECTION.md`](06_EXTERNAL_MEMORY_DIRECTION.md).

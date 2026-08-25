@@ -11,6 +11,11 @@ from memorex.wiki_first.models import AgentRunner, RunnerResult
 from memorex.wiki_first.service import WikiFirstService
 from memorex.wiki_first.storage import WikiStorage
 
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360f8cfc000000301010018dd8db10000000049454e44ae426082"
+)
+
 
 class RetrievalRunner(AgentRunner):
     name = "fake"
@@ -22,6 +27,12 @@ class RetrievalRunner(AgentRunner):
     def run(self, workdir: Path, prompt: str, *, writable: bool) -> RunnerResult:
         pages = {path.name for path in (workdir / "wiki").glob("*.md")}
         self.visible_pages.append(pages)
+        if "Write the complete answer" in prompt:
+            (workdir / "answer.md").write_text(
+                "Ответ из выбранных заметок.\n\n## Путь\n\n- [[alpha-topic]]\n",
+                encoding="utf-8",
+            )
+            return RunnerResult(self.name, self.model, "1", 1, "", "")
         sources = sorted((workdir / "sources").glob("*"))
         newest = sources[-1]
         if len(self.visible_pages) == 1:
@@ -77,13 +88,59 @@ def test_web_setup_upload_last_workspace_and_safe_markdown(tmp_path: Path) -> No
         remembered = create_app(None, user_settings_path=preferences)
         second = httpx2.ASGITransport(app=remembered)
         async with httpx2.AsyncClient(transport=second, base_url="http://test") as client:
-            assert "Obsidian vault" in (await client.get("/")).text
+            assert "Новая заметка" in (await client.get("/")).text
 
     asyncio.run(exercise())
     rendered = render_markdown("# Safe\n\n<script>alert(1)</script> [[topic]]")
     assert "<script>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert 'href="/wiki/topic"' in rendered
+    table = render_markdown("| Дата | Показание |\n| --- | ---: |\n| Сегодня | 123 [S1] |")
+    assert "<table>" in table
+    assert "<th>Дата</th>" in table
+    assert "<td>123 [S1]</td>" in table
+
+
+def test_web_saves_previews_and_serves_stored_image_without_analysis(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Image Web")
+    app = create_app(settings.root, user_settings_path=tmp_path / "preferences.json")
+
+    async def exercise() -> None:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/packets",
+                data={
+                    "file_options": '[{"mode":"store","instruction":""}]',
+                },
+                files={"files": ("photo.png", PNG, "image/png")},
+            )
+            assert response.status_code == 303
+            packet_id = response.headers["location"].split("saved=", 1)[1]
+            inbox = await client.get("/inbox")
+            assert "Сохранён без анализа" in inbox.text
+            assert "Анализировать все" in inbox.text
+            assert 'id="attachment-gallery"' in inbox.text
+            assert f"/packets/{packet_id}/items/" in inbox.text
+
+            packet = WikiStorage(settings).packet(packet_id)
+            item_id = str(packet["items"][0]["id"])
+            image = await client.get(f"/packets/{packet_id}/items/{item_id}")
+            assert image.status_code == 200
+            assert image.headers["content-type"] == "image/png"
+            assert image.content == PNG
+
+            invalid = await client.post(
+                "/packets",
+                files={"files": ("broken.png", b"not an image", "image/png")},
+            )
+            assert invalid.status_code == 422
+            assert len(WikiStorage(settings).packets()) == 1
+
+    asyncio.run(exercise())
+    rendered = render_markdown("![Скан](../sources/r1-photo.png)")
+    assert '<img class="wiki-image"' in rendered
+    assert 'src="/source/r1-photo.png"' in rendered
 
 
 def test_web_downloads_and_restores_full_workspace(tmp_path: Path) -> None:
@@ -129,6 +186,108 @@ def test_web_downloads_and_restores_full_workspace(tmp_path: Path) -> None:
     packets = WikiStorage(WorkspaceSettings.load(settings.root)).packets()
     assert [packet["id"] for packet in packets] == [original["id"]]
     assert list((tmp_path / ".memorex-backups").glob("*.memorex.zip"))
+
+
+def test_web_exposes_memory_question_and_literal_review_editor(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Editable Web")
+    runner = RetrievalRunner()
+    service = WikiFirstService(settings, runner_resolver=lambda _name: runner)
+    packet = service.create_packet(user_note="Посмотреть фильм.", files=[], urls=[])
+    proposed = service.ingest_packet(str(packet["id"]))
+    job_id = str(proposed["job_id"])
+    proposal = service.storage.proposal(job_id)
+    stage = service.storage.root / str(proposal["relative_path"])
+    page = stage / "wiki" / "alpha-topic.md"
+    edited = page.read_text(encoding="utf-8").replace("Alpha datum.", "- Один фильм.")
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: runner,
+        user_settings_path=tmp_path / "preferences.json",
+    )
+
+    async def exercise() -> None:
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+            home = (await client.get("/")).text
+            assert "Найти в заголовках и тексте" in home
+            review = (await client.get(f"/review?job={job_id}")).text
+            assert "Редактировать Markdown вручную" in review
+            assert "Переделать моделью" in review
+            saved = await client.post(
+                f"/review/{job_id}/pages/alpha-topic.md/edit", data={"content": edited}
+            )
+            assert saved.status_code == 303
+
+    asyncio.run(exercise())
+    assert WikiStorage(settings).proposal(job_id)["revision_no"] == 2
+    assert len(runner.visible_pages) == 1
+
+
+def test_web_creates_edits_searches_and_discusses_notes(tmp_path: Path) -> None:
+    settings = WorkspaceSettings.create(tmp_path / "workspace", "Notes Web")
+    runner = RetrievalRunner()
+    app = create_app(
+        settings.root,
+        runner_resolver=lambda _name: runner,
+        user_settings_path=tmp_path / "preferences.json",
+    )
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            transport = httpx2.ASGITransport(app=app)
+            async with httpx2.AsyncClient(transport=transport, base_url="http://test") as client:
+                storage = WikiStorage(settings)
+                inbox = next(x for x in storage.notebooks() if x["system_key"] == "inbox")
+                created = await client.post(
+                    "/notes",
+                    data={
+                        "title": "Локальная заметка",
+                        "body": "Текст без модели.",
+                        "notebook_id": inbox["id"],
+                    },
+                    files={"attachments": ("image.png", PNG, "image/png")},
+                )
+                assert created.status_code == 303
+                note_url = created.headers["location"]
+                note_id = note_url.rsplit("/", 1)[1]
+                page = (await client.get(note_url)).text
+                assert "Локальная заметка" in page
+                assert "image.png" in page
+                editor = (await client.get(f"{note_url}/edit")).text
+                assert "Текст Markdown" in editor
+                snapshot = storage.active_snapshot()["id"]
+                saved = await client.post(
+                    note_url,
+                    data={
+                        "title": "Исправленная заметка",
+                        "body": "Точное содержимое.",
+                        "notebook_id": inbox["id"],
+                        "expected_snapshot_id": snapshot,
+                    },
+                )
+                assert saved.status_code == 303
+                found = (await client.get("/", params={"q": "Точное содержимое"})).text
+                assert "Исправленная заметка" in found
+
+                discussion = await client.post(
+                    "/discussions",
+                    data={"title": "Проверка", "note_ids": note_id},
+                )
+                session_url = discussion.headers["location"]
+                submitted = await client.post(
+                    f"{session_url}/messages", data={"question": "Что здесь записано?"}
+                )
+                assert submitted.status_code == 303
+                task_url = submitted.headers["location"]
+                task_id = task_url.split("/tasks/", 1)[1].split("?", 1)[0]
+                events = await client.get(f"/tasks/{task_id}/events")
+                assert '"phase": "done"' in events.text
+                assert session_url in events.text
+                result = (await client.get(session_url)).text
+                assert "Ответ из выбранных заметок" in result
+                assert "Сохранить ответ как заметку" in result
+
+    asyncio.run(exercise())
 
 
 def test_retrieval_hides_irrelevant_pages_and_merge_preserves_them(tmp_path: Path) -> None:
@@ -189,11 +348,20 @@ def test_web_packet_is_saved_then_automatically_processed(tmp_path: Path) -> Non
                     "/packets", data={"user_note": "Этот Packet должен спокойно подождать."}
                 )
                 assert waiting.headers["location"].startswith("/inbox?saved=")
+                proposals = []
+                for _attempt in range(100):
+                    proposals = storage.proposals()
+                    if len(proposals) == 2:
+                        break
+                    await asyncio.sleep(0.01)
+                assert len(proposals) == 2
                 inbox = await client.get("/inbox")
                 assert "Этот Packet должен спокойно подождать" in inbox.text
-                assert "Сохранён · ожидает анализа" in inbox.text
+                assert inbox.text.count("Готов к проверке") == 2
                 statuses = (await client.get("/api/packets")).json()
-                assert any(item["state"] == "queued" for item in statuses)
+                assert sum(item["state"] == "review" for item in statuses) == 2
+                reviews = await client.get("/review")
+                assert all(str(item["id"]) in reviews.text for item in proposals)
 
     asyncio.run(exercise())
 

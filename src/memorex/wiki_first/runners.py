@@ -48,8 +48,15 @@ class CLIAgentRunner(AgentRunner):
         self.effort = effort
         self.timeout = timeout
 
-    def run(self, workdir: Path, prompt: str, *, writable: bool) -> RunnerResult:
-        return self.run_with_progress(workdir, prompt, writable=writable)
+    def run(
+        self,
+        workdir: Path,
+        prompt: str,
+        *,
+        writable: bool,
+        images: list[Path] | None = None,
+    ) -> RunnerResult:
+        return self.run_with_progress(workdir, prompt, writable=writable, images=images)
 
     def run_with_progress(
         self,
@@ -57,13 +64,14 @@ class CLIAgentRunner(AgentRunner):
         prompt: str,
         *,
         writable: bool,
+        images: list[Path] | None = None,
         progress: Callable[[dict[str, object]], None] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> RunnerResult:
         executable = shutil.which(self.name)
         if executable is None:
             raise RunnerError(f"Runner executable is not installed: {self.name}")
-        command = self._command(executable, prompt, writable=writable)
+        command = self._command(executable, prompt, writable=writable, images=images or [])
         version = self._version(executable)
         started = time.monotonic()
         if progress:
@@ -142,11 +150,14 @@ class CLIAgentRunner(AgentRunner):
             )
         return result
 
-    def _command(self, executable: str, prompt: str, *, writable: bool) -> list[str]:
+    def _command(
+        self, executable: str, prompt: str, *, writable: bool, images: list[Path]
+    ) -> list[str]:
         if self.name == "claude":
             tools = "Read,Glob,Grep" if not writable else "Read,Write,Edit,Glob,Grep"
             return [
                 executable,
+                "--safe-mode",
                 "--model",
                 self.model,
                 "--effort",
@@ -163,7 +174,7 @@ class CLIAgentRunner(AgentRunner):
                 prompt,
             ]
         sandbox = "workspace-write" if writable else "read-only"
-        return [
+        command = [
             executable,
             "exec",
             "--model",
@@ -174,8 +185,11 @@ class CLIAgentRunner(AgentRunner):
             sandbox,
             "--skip-git-repo-check",
             "--json",
-            prompt,
         ]
+        if images:
+            command.extend(["--image", *(str(path) for path in images)])
+        command.extend(["--", prompt])
+        return command
 
     def _version(self, executable: str) -> str | None:
         try:
