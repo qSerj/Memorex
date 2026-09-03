@@ -14,9 +14,10 @@ are necessary diagnostics.
 
 An architectural idea is not an implementation request. First identify the observed problem it
 solves, always consider changing nothing, and prefer the smallest fix. Do not add a subsystem or
-general framework without explicit user direction. Feature development is frozen through
-2026-09-15: immediately fix only data loss/corruption, a broken promised scenario, or a strong UX
-blocker observed at least three times; record other ideas in the local `USAGE_LOG.md`.
+general framework without explicit user direction. Small, local improvements to an existing user
+flow are welcome when they have a clear benefit. Before adding a large subsystem, first identify
+the observed problem and record it in the local `USAGE_LOG.md`; loss/corruption and broken promised
+scenarios always take priority.
 
 ## Project Structure
 
