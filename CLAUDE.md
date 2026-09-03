@@ -2,140 +2,75 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Repository status (read first)
+## What this repository is
 
-This repo holds the **Python application** line of Memorex. Since 2026-08-26 daily use has moved to
-a **markdown incarnation** of the same idea (rules + Obsidian + terminal, living in a separate
-workspace); the app has not been used since. `КАК_ПРОДОЛЖИТЬ.md` states this explicitly: the app is
-not deleted and remains a test-bed, but documents `00`–`06` describe a superseded line, and
-`07_ГДЕ_НУЖЕН_ИИ.md` / `08_РАБОТА_С_ИДЕЯМИ.md` describe the current direction.
+Memorex is no longer a Python application. Since 2026-08-26 the product is a personal external
+memory made of plain markdown files that a strong model reads and edits by written rules — no
+server, no database, no code standing between the owner and their notes. This repository holds the
+source of the rules and how the project arrived here, not the memory itself: the actual vault lives
+outside the repo and is never published. See [`README.md`](README.md) for why the project exists and
+[`docs/ИСТОРИЯ.md`](docs/ИСТОРИЯ.md) for how it got here, including where the earlier Python line
+went (it survives in the `wiki-first` and `legacy/provenance-compiler` branches — do not resurrect
+it here without explicit direction).
 
-Practical consequence: do not treat roadmap items in `00`–`06` or "Ближайшая работа" in
-`КАК_ПРОДОЛЖИТЬ.md` as live plans. Fix what is asked; ask before resuming the app roadmap.
+Everything in this repo is Markdown, plus the shell script that packages it. There is no build, no
+lint, no test suite, and no CI.
 
-Project docs are in Russian; code, identifiers and docstrings are in English; the web UI is Russian.
+## Layout
 
-## Commands
+- [`memory-kit/`](memory-kit/) — the installable skill. This is the only thing under active
+  development here.
+- [`docs/`](docs/) — current-direction documents (`ГДЕ_НУЖЕН_ИИ.md`, `РАБОТА_С_ИДЕЯМИ.md`) and
+  `docs/archive/`, memory pages copied verbatim from the vault that recorded the shift away from
+  the Python line. Archive pages carry Obsidian frontmatter and `[[wiki-links]]` that don't resolve
+  on GitHub; don't "fix" them, they are evidence, not documentation.
 
-```bash
-uv sync --locked --all-groups
-uv run ruff check .
-uv run ruff format --check .
-uv run pytest
-```
+## memory-kit
 
-All three checks must pass before committing — CI (`.github/workflows/`) runs exactly these.
+`memory-kit` is the source of `memory-setup`, a Claude Code skill that bootstraps a markdown memory
+vault in an empty directory (or updates the rules in one already deployed) without touching what
+the owner has accumulated. Read `memory-kit/README.md` before changing anything here — it explains
+the install/update contract in full. The essentials:
 
-```bash
-uv run pytest tests/test_wiki_first.py::test_name    # single test
-uv run memorex app ./my-knowledge                    # current app, http://127.0.0.1:8766
-uv run memorex --help                                # legacy compiler CLI
-```
+- **The kit is the single source of rules.** A vault gets a copy at install time and lives on its
+  own after that. A fix made by hand inside a live vault is lost the next time that vault updates,
+  unless it is ported back into `memory-kit/references/` here.
+- `references/*.md` are copied verbatim into a fresh vault (skills, `.gitignore`, friction log
+  template, actions templates). `references/claude-md.md` and `references/memory-identity.md`
+  additionally carry `{{placeholders}}` filled in from the owner's answers during setup.
+- Bump `VERSION` (semver) for every rule change. If the change requires anything from data already
+  in a vault — a new required frontmatter field, a renamed folder, a changed line format — add a
+  step file to `migrations/`, named `<from>-to-<to>.md`; format and constraints are in
+  `migrations/README.md`. The hard rule there: a migration changes form, never drops content.
+- `./memory-kit/build.sh` packages `SKILL.md`, `VERSION`, `references/` and `migrations/` into
+  `memory-setup.zip` (git-ignored, rebuilt on demand) for installing as a skill in Claude Code.
 
-Tests run fully offline with fake runners and fake providers. Never add a test that needs network
-access or credentials.
+### Treating a live vault as a module
 
-## Two stacked systems
+The owner runs a live vault at `~/Projects/MemorexClaude`, installed by this kit. Every vault this
+kit deploys carries the same self-contained contract: its own root `CLAUDE.md` (from
+`references/claude-md.md`) and `.claude/skills/{remember,ingest,review}/` fully specify how to read
+and write it — search `memory/` before answering, cite the pages an answer is built from, run new
+material through `remember` (one thought) or `ingest` (a messy batch) rather than writing into
+`memory/` by hand, commit after every change that touches it. Treat the vault as a module with that
+file as its interface, not as a directory to explore freely:
 
-The package contains two generations of code. Know which one a task belongs to.
+- **Answering a question from it.** When the owner points at the vault to ground something (`go
+  check what's currently true there`), read only what its own rules point to — `grep`/`glob` over
+  `memory/`, not a manual crawl of the whole tree.
+- **Handing it material.** Route it through the vault's own `remember`/`ingest` skill file instead
+  of improvising a write — that is its API, and bypassing it defeats the gate the owner relies on.
+- **Porting a fix back.** The owner sometimes patches the vault by hand when a rule is in the way of
+  real work. When they point at a specific fix, read exactly the files they name and port it into
+  `memory-kit/references/` (plus a migration if it affects existing pages).
 
-**Current — Wiki-first / Notes** (`wiki_app.py`, `wiki_templates/`, `wiki_static/`,
-`wiki_first/`, `workspace_archive.py`). This is the product: local notes, notebooks, FTS search,
-attachments, Packet capture, AI proposals, discussions, history, backup/restore.
-
-**Legacy — provenance compiler** (`cli.py` legacy commands, `storage.py`, `compiler.py`,
-`extraction.py`, `query.py`, `web.py`, `llm.py`, `ingest.py`, `inbox.py`, `evaluation.py`,
-`domain.py`). A retained research prototype (atomic claims, evidence offsets, entities, typed
-relations, contradiction review, eval) tagged `provenance-compiler-prototype`. It talks to an
-OpenAI-compatible endpoint via `MEMOREX_LLM_*` env vars, not to CLI runners. It is not the current
-user path — do not extend it without explicit direction, and do not break it either.
-
-Both share `config.py` (`WorkspaceSettings` from `memorex.toml`) and the numbered SQL migrations
-directory, but they use different databases and different `Storage` classes with the same name.
-
-## Wiki-first architecture
-
-- `wiki_app.py` — FastAPI routes, Jinja templates, background task orchestration.
-- `wiki_first/service.py` — all business operations (`WikiFirstService`); the only place that
-  composes snapshots, prompts, runners and storage.
-- `wiki_first/storage.py` — the SQLite boundary (`state.sqlite`) plus the file snapshot tree. All
-  SQL lives here; nothing above it writes SQL.
-- `wiki_first/runners.py` — subprocess adapters for the `claude` and `codex` CLIs.
-- `wiki_first/prompts.py` / `validation.py` / `models.py` — versioned prompts, wiki-tree validation,
-  Pydantic response models.
-
-### Data model invariants
-
-Workspace layout is documented in `ARCHITECTURE.md`. The invariants that drive most code:
-
-- **Notes are Markdown files inside an immutable snapshot tree.** A snapshot directory is made
-  read-only after it is written; SQLite only indexes identity, notebook membership, FTS, attachments
-  and which snapshot is active.
-- **Every save is a new snapshot.** `_save_note_snapshot` copies the active tree, writes the file,
-  validates, hashes, freezes it, then atomically activates it with an optimistic guard on
-  `expected_snapshot_id`. Never mutate an existing snapshot in place.
-- **User edits apply immediately; AI writes only a staged proposal** under `jobs/` that a human
-  accepts, revises or rejects. This is the core product rule, not a UI detail.
-- Original objects and attachments are content-addressed and immutable; ingest is idempotent;
-  answers under `answers/` are derived and rebuildable, never evidence.
-
-### Concurrency
-
-`WorkspaceTasks` in `wiki_app.py` runs a single-worker `mutations` executor, a 2-worker `queries`
-executor, and one `memorex-packet-queue` thread. The queue thread claims the next Packet from SQLite
-only when no mutation is in flight, so writes serialize. Packets survive restart: the queue is
-persistent, claims are atomic, and a pending/running discussion turn becomes retryable `failed` on
-next start. Long-running work is cancellable through per-task `threading.Event`s.
-
-### Model routing
-
-`memorex.toml` `[wiki.profiles.*]` defines simple / standard / fallback profiles. Routing lives in
-`WikiFirstService._ingest_spec` and `_fallback_spec`: small single-item intake → simple profile,
-everything else → standard, one retry on failure via fallback. **At most two model calls per user
-operation.** Every call is logged to `runner_calls` with profile, runner, model, effort, prompt
-version, duration, status and token counts — never secrets. Bump the `*_PROMPT_VERSION` constants in
-`prompts.py` when you change a prompt.
-
-Runners shell out to the `claude` / `codex` CLIs with restricted tool sets and sandbox flags
-(`_command` in `runners.py`). In tests, inject a fake through
-`WikiFirstService(settings, runner_resolver=...)`.
-
-### Migrations
-
-Numbered `.sql` files in `src/memorex/migrations/`. Wiki-first applies
-`[0-9][0-9][0-9]_wiki_first_*.sql` in order and records them in `schema_migrations`; the legacy
-compiler applies its own set. Migrations are forward-only and must not break existing snapshots of
-a real workspace.
+In every case: don't browse the rest of that vault or any other project on your own. It's personal,
+and the owner points at what's relevant rather than asking for a scan.
 
 ## Working conventions
 
-From `AGENTS.md`, the ones that actually change decisions:
-
-- **An architectural idea is not an implementation request.** Identify the observed problem, always
-  consider changing nothing, prefer the smallest fix. New subsystems require repeated observed pain
-  recorded in the local `USAGE_LOG.md` (git-ignored; `USAGE_LOG.example.md` is the template). Data
-  loss and broken promised scenarios always take priority.
-- **User language in the UI.** `Packet` → «Добавление / сохранённый материал», `proposal` →
-  «Предложение AI / На проверку», `provenance` → «Источники», `attempt` → «Попытка». Never expose
-  runner, job, snapshot, queue or database vocabulary outside diagnostics.
-- **An existing Note defines its own schema.** When AI edits a note, preserve headings, order,
-  table/list shape, tone, links and the source footer; make the smallest requested change.
-- Validate every structured model response with Pydantic. Never add an unvalidated JSON fallback.
-- Ruff, line length 100, four-space indent, type annotations, small single-purpose modules.
-- Never commit `.env`, API keys, `.memorex/`, `USAGE_LOG.md`, `my-knowledge/`, or `Inbound/`.
-
-Pytest is required for every behavioral change. Cover model routing and fallback, unchanged
-re-ingest, source immutability, local capture before AI, direct note editing, proposal validation,
-queue recovery, readable export and full backup/restore.
-
-Commits: short imperative subject (`Preserve existing note structure`). PRs state the observed
-problem, the smallest chosen change, schema/pipeline impact and validation performed.
-
-## Document map
-
-- `README.md` — product overview, user-facing feature list, how to run.
-- `ARCHITECTURE.md` — internal layers, storage tree, vocabulary table, model routing.
-- `05_IMPLEMENTATION_STATUS.md` — what actually works and what is deliberately not built.
-- `07_ГДЕ_НУЖЕН_ИИ.md`, `08_РАБОТА_С_ИДЕЯМИ.md` — current direction (markdown line).
-- `00`–`06`, `КАК_ПРОДОЛЖИТЬ.md` below «Точка передачи» — superseded app line, kept for context.
-- `experiments/wiki_first/` — historical experiment material, not a roadmap.
+- Docs and vault-facing rule text are written in Russian; this file is in English.
+- An architectural idea is not an implementation request: identify the observed problem, always
+  consider changing nothing first, prefer the smallest fix. This applies doubly to `memory-kit`,
+  whose rules were grown from real friction in `~/Projects/MemorexClaude`, not designed up front.
+- Commits: short imperative subject line, one coherent change per commit.
