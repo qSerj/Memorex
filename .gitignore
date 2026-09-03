@@ -3,7 +3,6 @@
 /.serena/
 /.venv/
 /Inbound/
-/my-knowledge/
 /USAGE_LOG.md
 
 .env
